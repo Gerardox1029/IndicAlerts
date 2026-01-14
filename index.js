@@ -29,7 +29,8 @@ let history = [];
 // --- 2. LÓGICA DE DATOS (Binance API) ---
 async function fetchData(symbol, interval, limit = 100) {
     try {
-        const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        // Usamos data-api.binance.vision para evitar bloqueo 451 (Geo-restriction) en servidores de EE.UU. (Render)
+        const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         const response = await axios.get(url);
         const closes = response.data.map(k => parseFloat(k[4]));
         const closeTimes = response.data.map(k => k[6]);
@@ -102,22 +103,40 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
 }
 
 // --- 5. NOTIFICACIONES TELEGRAM ---
+// --- 5. NOTIFICACIONES TELEGRAM (Axios Method) ---
 async function enviarTelegram(message) {
     const token = process.env.TELEGRAM_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
+    const destinatarios = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
-    if (!token || !chatId || token === 'your_telegram_bot_token_here') {
-        console.warn('Telegram credentials not set.');
+    if (!token || destinatarios.length === 0 || token === 'your_telegram_bot_token_here') {
+        console.warn('Telegram credentials not set or no recipients found.');
         return;
     }
 
-    try {
-        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-            chat_id: chatId,
-            text: message
-        });
-    } catch (error) {
-        console.error('Error sending Telegram message:', error.message);
+    // Usamos un bucle for...of para manejar las promesas secuencialmente y ver errores claros
+    for (const chatId of destinatarios) {
+        try {
+            console.log(`Intentando enviar a ID: ${chatId}...`);
+            const url = `https://api.telegram.org/bot${token}/sendMessage`;
+            const payload = {
+                chat_id: chatId,
+                text: message
+            };
+
+            await axios.post(url, payload);
+            console.log(`✅ Mensaje enviado correctamente a: ${chatId}`);
+
+        } catch (error) {
+            console.error(`❌ ERROR enviando a ${chatId}:`);
+            if (error.response) {
+                // El servidor respondió con un código de estado fuera de 2xx
+                console.error(`Status: ${error.response.status}`);
+                console.error(`Data: ${JSON.stringify(error.response.data)}`);
+            } else {
+                console.error(error.message);
+            }
+        }
     }
 }
 
