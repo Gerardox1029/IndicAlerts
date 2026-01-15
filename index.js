@@ -42,6 +42,7 @@ async function fetchData(symbol, interval, limit = 100) {
 }
 
 // --- 3. MOTOR MATEMÁTICO ---
+// --- 3. MOTOR MATEMÁTICO ---
 function calcularIndicadores(closes) {
     if (!closes || closes.length < 50) return null;
 
@@ -55,34 +56,76 @@ function calcularIndicadores(closes) {
     const smaInput = { period: 20, values: rsiValues };
     const rsiSuavizadoValues = SMA.calculate(smaInput);
 
-    if (rsiSuavizadoValues.length < 2) return null;
+    if (rsiSuavizadoValues.length < 15) return null; // Necesitamos al menos 10 periodos previos + actuales
 
     const currentRsiSuavizado = rsiSuavizadoValues[rsiSuavizadoValues.length - 1];
     const prevRsiSuavizado = rsiSuavizadoValues[rsiSuavizadoValues.length - 2];
     const tangente = currentRsiSuavizado - prevRsiSuavizado;
 
-    // RSI 22 (Para Reporte Manual)
+    // Análisis de Curvatura (Últimos 10 periodos)
+    // Tomamos los últimos 10 valores (sin incluir el actual si se prefiere, pero aquí tomamos el slice final)
+    const recentValues = rsiSuavizadoValues.slice(-11, -1); // 10 valores previos al actual
+
+    // Simplificamos: Si la mayoría de los pasos son bajistas -> Tendencia bajista, y viceversa.
+    // O más estricto: "cada vez es menor" -> Estrictamente decreciente.
+    let increasingCount = 0;
+    let decreasingCount = 0;
+    for (let i = 1; i < recentValues.length; i++) {
+        if (recentValues[i] > recentValues[i - 1]) increasingCount++;
+        if (recentValues[i] < recentValues[i - 1]) decreasingCount++;
+    }
+
+    let curveTrend = 'NEUTRAL';
+    const threshold = recentValues.length - 1; // Ej: 9 comparaciones
+    // Podemos ser flexibles (ej: 80% consistencia) o estrictos (100%).
+    // El prompt dice "cada vez es menor", implica stricto o casi estricto.
+    if (decreasingCount >= threshold * 0.9) curveTrend = 'DOWN';
+    else if (increasingCount >= threshold * 0.9) curveTrend = 'UP';
+
+    // RSI 22 (Para Reporte Manual - si se requiere)
     const rsi22Values = RSI.calculate({ values: closes, period: 22 });
     const currentRsi22 = rsi22Values.length > 0 ? rsi22Values[rsi22Values.length - 1] : 0;
 
     return {
         rsiSuavizado: currentRsiSuavizado,
         tangente: tangente,
-        rsi22: currentRsi22,
+        curveTrend: curveTrend,
         currentPrice: closes[closes.length - 1]
     };
 }
 
-// --- 4. SISTEMA DE ALERTAS (Lógica Ditox_18) ---
+// Helper para determinar Estado y Emojis
+function obtenerEstado(tangente, curveTrend) {
+    if (tangente > 1) return { text: "LONG en euforia, no buscar SHORT", emoji: "🚀" };
+    if (tangente > 0.10) return { text: "LONG en curso...", emoji: "🟢" };
+
+    if (tangente < -1) return { text: "SHORT en euforia, no buscar LONG", emoji: "🩸" };
+    if (tangente < -0.10) return { text: "SHORT en curso...", emoji: "🔴" };
+
+    // Rango -0.10 a 0.10
+    if (curveTrend === 'DOWN') return { text: "En terreno de LONG", emoji: "🍏" }; // Reversión de caída
+    if (curveTrend === 'UP') return { text: "En terreno de SHORT", emoji: "🍎" }; // Reversión de subida
+
+    return { text: "En terreno de INDECISIÓN", emoji: "🦀" };
+}
+
+// --- 4. SISTEMA DE ALERTAS (Lógica Ditox_18 Mejorada) ---
 function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
-    const { rsiSuavizado, tangente } = indicadores;
+    const { tangente, curveTrend } = indicadores;
     let signal = null;
 
-    if (tangente >= -0.10 && tangente <= 0 && rsiSuavizado < 50) {
-        signal = 'LONG';
-    }
-    else if (tangente >= 0 && tangente <= 0.10 && rsiSuavizado > 50) {
-        signal = 'SHORT';
+    // Usamos la misma lógica que obtenerEstado para determinar la señal base
+    // Pero 'evaluarAlertas' en el código original solo disparaba en el cruce de 0
+    // EL NUEVO REQUERIMIENTO: "determinará que la señal es LONG... en el rango -0.10 y +0.10"
+
+    if (tangente >= -0.10 && tangente <= 0.10) {
+        if (curveTrend === 'DOWN') signal = 'LONG';
+        else if (curveTrend === 'UP') signal = 'SHORT';
+    } else {
+        // Mantenemos lógica de tendencia fuerte si se desea alertar también, 
+        // pero el prompt enfoca la "Señal" exacta en la reversión (rango pequeño).
+        // Si el usuario quiere alertas en otros estados, se añadirían aquí.
+        // Por ahora nos ceñimos a la "propuetsa" del usuario sobre la curva en el rango.
     }
 
     if (!signal) return null;
@@ -102,11 +145,12 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
     return signal;
 }
 
-// --- 5. NOTIFICACIONES TELEGRAM ---
-// --- 5. NOTIFICACIONES TELEGRAM (Axios Method) ---
+// --- 5. NOTIFICACIONES TELEGRAM (Multi-User) ---
 async function enviarTelegram(message) {
     const token = process.env.TELEGRAM_TOKEN;
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
+
+    // Soporte para múltiples IDs separados por coma y limpieza de espacios
     const destinatarios = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
     if (!token || destinatarios.length === 0 || token === 'your_telegram_bot_token_here') {
@@ -114,7 +158,7 @@ async function enviarTelegram(message) {
         return;
     }
 
-    // Usamos un bucle for...of para manejar las promesas secuencialmente y ver errores claros
+    // Bucle para enviar a todos los destinatarios
     for (const chatId of destinatarios) {
         try {
             console.log(`Intentando enviar a ID: ${chatId}...`);
@@ -125,17 +169,16 @@ async function enviarTelegram(message) {
             };
 
             await axios.post(url, payload);
-            console.log(`✅ Mensaje enviado correctamente a: ${chatId}`);
+            console.log(`✅ Mensaje enviado a: ${chatId}`);
 
         } catch (error) {
             console.error(`❌ ERROR enviando a ${chatId}:`);
             if (error.response) {
-                // El servidor respondió con un código de estado fuera de 2xx
-                console.error(`Status: ${error.response.status}`);
-                console.error(`Data: ${JSON.stringify(error.response.data)}`);
+                console.error(`Status: ${error.response.status}, Data: ${JSON.stringify(error.response.data)}`);
             } else {
                 console.error(error.message);
             }
+            // Continuamos con el siguiente ID aunque falle este
         }
     }
 }
@@ -144,7 +187,6 @@ async function enviarTelegram(message) {
 app.get('/report/:symbol/:interval', async (req, res) => {
     const { symbol, interval } = req.params;
 
-    // Validar parámetros
     if (!SYMBOLS.includes(symbol) || !INTERVALS.includes(interval)) {
         return res.status(400).send('Invalid Symbol or Interval');
     }
@@ -157,12 +199,12 @@ app.get('/report/:symbol/:interval', async (req, res) => {
     const indicadores = calcularIndicadores(marketData.closes);
     if (!indicadores) return res.status(500).send('Error calculating indicators');
 
-    const message = `📋 REPORTE MANUAL
-Instrumento: ${symbol} (${interval})
+    const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend);
+
+    const message = `✍️ REPORTE MANUAL
+💎 ${symbol} (${interval})
 Precio: ~${indicadores.currentPrice}
-RSI (22): ${indicadores.rsi22.toFixed(2)}
-RSI Suavizado (20,20): ${indicadores.rsiSuavizado.toFixed(2)}
-Tangente: ${indicadores.tangente.toFixed(4)}`;
+Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
 
     await enviarTelegram(message);
     res.send('Reporte enviado a Telegram!');
@@ -188,14 +230,14 @@ async function procesarMercado() {
             const signal = evaluarAlertas(symbol, interval, indicadores, lastCandleTime);
 
             if (signal) {
+                const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend);
+
                 const message = `🚀 ALERTA DITOX
 
 💎 ${symbol}
 
 ⏱ Temporalidad: ${interval}
-📈 Tipo: ${signal}
-📊 RSI Suavizado: ${indicadores.rsiSuavizado.toFixed(2)}
-📐 Tangente: ${indicadores.tangente.toFixed(4)}`;
+📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
 
                 await enviarTelegram(message);
 
@@ -259,7 +301,7 @@ app.get('/', (req, res) => {
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>Crypto Ditox Monitor V2</title>
+    <title>IndicAlerts - Crypto Ditox Monitor V2</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background-color: #111827; color: #e5e7eb; font-family: 'Inter', sans-serif; }</style>
 </head>
@@ -340,3 +382,12 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });
+
+// Exportar para tests (si se requiere)
+module.exports = {
+    calcularIndicadores,
+    obtenerEstado,
+    evaluarAlertas,
+    enviarTelegram,
+    app
+};
