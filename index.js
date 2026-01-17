@@ -152,7 +152,7 @@ function obtenerEstado(tangente, curveTrend) {
     if (curveTrend === 'DOWN') return { text: "En terreno de LONG", emoji: "🍏", color: "text-lime-400" };
     if (curveTrend === 'UP') return { text: "En terreno de SHORT", emoji: "🍎", color: "text-orange-400" };
 
-    return { text: "En terreno de INDECISIÓN", emoji: "🦀", color: "text-gray-400" };
+    return { text: "Indecisión (No operar)", emoji: "🦀", color: "text-gray-400" };
 }
 
 function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
@@ -192,26 +192,95 @@ async function enviarTelegram(message) {
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
     const envIds = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
-    // Unificar destinatarios (Env IDs + Usuarios Suscritos)
-    // Convertimos todo a string para evitar duplicados por tipo
     const allRecipients = new Set([...envIds, ...subscribedUsers]);
+
+    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios.`);
+
+    const sentMessages = []; // Array de { chatId, messageId }
 
     for (const chatId of allRecipients) {
         try {
             const options = {};
-            // Si es el grupo específico, añadir message_thread_id
-            if (chatId === TARGET_GROUP_ID && THREAD_ID) {
+            // Comparación robusta
+            if (String(chatId).trim() === String(TARGET_GROUP_ID).trim() && THREAD_ID) {
                 options.message_thread_id = parseInt(THREAD_ID);
             }
 
-            await bot.sendMessage(chatId, message, options);
-            console.log(`✅ Mensaje enviado a: ${chatId} (Thread: ${options.message_thread_id || 'N/A'})`);
+            const sentMsg = await bot.sendMessage(chatId, message, options);
+            console.log(`✅ Mensaje enviado a: ${chatId} (Thread: ${options.message_thread_id || 'N/A'}) - MsgID: ${sentMsg.message_id}`);
+
+            sentMessages.push({
+                chatId: chatId,
+                messageId: sentMsg.message_id
+            });
 
         } catch (error) {
             console.error(`❌ ERROR enviando a ${chatId}:`, error.message);
         }
     }
+    return sentMessages;
 }
+
+// Endpoint de prueba
+app.get('/test-alert', async (req, res) => {
+    const msg = `🧪 ALERTA DE PRUEBA
+    
+Si ves esto en el HILO, funciona correctamente.
+Si ves esto en privado, también funciona.`;
+
+    await enviarTelegram(msg);
+    res.send('Alerta de prueba enviada a todos los destinatarios.');
+});
+
+// Endpoint para SIMULAR una señal de mercado (LONG/SHORT)
+app.get('/simulate/:symbol/:type', async (req, res) => {
+    const { symbol, type } = req.params;
+    const interval = '2h';
+    const sUpper = symbol.toUpperCase();
+
+    // Valores falsos para forzar la señal
+    let tangente = 0;
+    let curveTrend = 'NEUTRAL';
+    let emoji = '❓';
+    let text = 'Desconocido';
+
+    if (type.toUpperCase() === 'LONG') {
+        tangente = 0.05; // Dentro del rango -0.10 a 0.10
+        curveTrend = 'DOWN'; // Reversión alcista
+        text = "En terreno de LONG";
+        emoji = "🍏";
+    } else if (type.toUpperCase() === 'SHORT') {
+        tangente = -0.05;
+        curveTrend = 'UP';
+        text = "En terreno de SHORT";
+        emoji = "🍎";
+    }
+
+    const message = `🚀 ALERTA DITOX (SIMULACRO)
+
+💎 ${sUpper}
+
+⏱ Temporalidad: ${interval}
+📈 Estado: ${text} ${emoji}`;
+
+    const sentMessages = await enviarTelegram(message);
+
+    // También agregamos al historial para que se vea en el dashboard
+    history.unshift({
+        time: new Date().toISOString(),
+        symbol: sUpper,
+        interval,
+        signal: type.toUpperCase(),
+        estadoText: text,
+        tangente: tangente,
+        sentMessages: sentMessages || [],
+        observation: null,
+        id: Date.now() // Unique ID for finding this signal later
+    });
+    if (history.length > 20) history.pop();
+
+    res.send(`Simulacro de ${type} para ${sUpper} enviado.`);
+});
 
 // Escuchar comandos
 if (bot) {
@@ -219,7 +288,7 @@ if (bot) {
     bot.onText(/\/start/, (msg) => {
         const chatId = msg.chat.id;
         saveUser(chatId);
-        bot.sendMessage(chatId, "👋 ¡Bienvenido a IndicAlerts Ditox!\n\nEstás suscrito a las alertas automáticas. También puedes usar comandos como /reportBTC o /reportSOL para ver el estado actual.");
+        bot.sendMessage(chatId, "👋 ¡Bienvenido a IndicAlerts Ditox!\n\nEstás suscrito a las alertas automáticas. También puedes usar comandos como /reportBTC o /reportSOL para ver el estado actual.\n\n Recuerda: Este bot no hace trading, solo resume la situación del mercado y envía alertas.");
     });
 
     bot.onText(/\/report(.+)/, async (msg, match) => {
@@ -274,6 +343,78 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
     console.log('Bot escuchando comandos /report...');
 }
 
+// Endpoint ADMIN para actualizar señal
+app.use(express.json()); // Necesario para parsear body JSON
+
+app.post('/admin/update-signal', async (req, res) => {
+    const { password, signalId, observationType } = req.body;
+
+    if (password !== 'awd ') { // Contraseña "awd " con espacio
+        return res.status(403).json({ success: false, message: 'Contraseña incorrecta' });
+    }
+
+    const signalIndex = history.findIndex(h => h.id == signalId);
+    if (signalIndex === -1) {
+        return res.status(404).json({ success: false, message: 'Señal no encontrada' });
+    }
+
+    const signalEntry = history[signalIndex];
+
+    // Si ya tenía observación, la actualizamos.
+    signalEntry.observation = observationType;
+
+    // Reconstruir mensaje original + observación
+    // Recalculamos el estadoInfo original basado en tangente almacenada o texto almacenado
+    // Para simplificar, usamos el texto guardado en history.
+
+    // Emojis mapping para observación
+    let obsEmoji = "";
+    if (observationType.includes("Señal dudosa")) obsEmoji = "🤔";
+    else if (observationType.includes("Señal FALSA")) obsEmoji = "❌";
+    else if (observationType.includes("Liquidaciones a favor")) obsEmoji = "💰";
+    else if (observationType.includes("Liquidaciones en contra")) obsEmoji = "💀";
+
+    // Reconstruir el mensaje base. NOTA: Esto debe coincidir con el formato original.
+    // Como no guardamos el mensaje exacto, lo reconstruimos.
+    // Buscamos el emoji del estado original.
+    // Esto es un poco hacky si cambió la lógica, pero servirá.
+
+    // MEJORA: Guardar el mensaje base en history o reconstruirlo igual.
+    // Reconstrucción:
+    const baseMessage = `🚀 ALERTA DITOX
+
+💎 ${signalEntry.symbol}
+
+⏱ Temporalidad: ${signalEntry.interval}
+📈 Estado: ${signalEntry.estadoText} ${signalEntry.estadoText.includes('LONG') && signalEntry.tangente > 1 ? '🚀' :
+            signalEntry.estadoText.includes('LONG') ? '🟢' :
+                signalEntry.estadoText.includes('SHORT') && signalEntry.tangente < -1 ? '🩸' :
+                    signalEntry.estadoText.includes('SHORT') ? '🔴' :
+                        signalEntry.estadoText.includes('Terreno de LONG') ? '🍏' : '🍎'}
+ Observación (by Ditox): ${observationType} ${obsEmoji}`;
+
+    console.log(`📝 Actualizando señal ${signalId} con observación: ${observationType}`);
+
+    // Iterar y editar mensajes
+    if (signalEntry.sentMessages && Array.isArray(signalEntry.sentMessages)) {
+        for (const msgInfo of signalEntry.sentMessages) {
+            try {
+                if (bot) {
+                    await bot.editMessageText(baseMessage, {
+                        chat_id: msgInfo.chatId,
+                        message_id: msgInfo.messageId
+                    });
+                    console.log(`Message updated for chat ${msgInfo.chatId}`);
+                }
+            } catch (error) {
+                console.error(`Failed to edit message for ${msgInfo.chatId}:`, error.message);
+            }
+        }
+    }
+
+    res.json({ success: true, message: 'Observación actualizada y mensajes editados.' });
+});
+
 
 // --- 5. BUCLE PRINCIPAL ---
 async function procesarMercado() {
@@ -313,13 +454,16 @@ async function procesarMercado() {
 ⏱ Temporalidad: ${interval}
 📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
 
-                await enviarTelegram(message);
+                const sentMessages = await enviarTelegram(message);
 
                 history.unshift({
                     time: new Date().toISOString(),
                     symbol, interval, signal,
                     estadoText: estadoInfo.text,
-                    tangente: indicadores.tangente
+                    tangente: indicadores.tangente,
+                    sentMessages: sentMessages || [],
+                    observation: null,
+                    id: Date.now()
                 });
                 if (history.length > 20) history.pop();
             }
@@ -371,7 +515,24 @@ app.get('/', (req, res) => {
          `;
     }).join('');
 
-    const historyRows = history.map(h => `
+    const historyRows = history.map(h => {
+        const obs = h.observation ? `<span class="block text-xs text-yellow-400 mt-1">📝 ${h.observation}</span>` : '';
+        const adminControls = `
+            <div class="ditox-admin hidden mt-2">
+                <select id="obs-select-${h.id}" class="bg-gray-700 text-xs text-white p-1 rounded mb-1 w-full">
+                    <option value="">Seleccionar Observación...</option>
+                    <option value="Señal dudosa">Señal dudosa</option>
+                    <option value="Señal FALSA">Señal FALSA</option>
+                    <option value="Liquidaciones a favor de la señal">Liquidaciones a favor</option>
+                    <option value="Liquidaciones en contra de la señal">Liquidaciones en contra</option>
+                </select>
+                <button onclick="updateSignal('${h.id}')" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-1 rounded w-full">
+                    Actualizar Reporte
+                </button>
+            </div>
+        `;
+
+        return `
         <tr class="border-b border-gray-700/50 hover:bg-white/5 transition-colors">
             <td class="py-4 px-6 text-gray-400 font-mono text-xs">${new Date(h.time).toLocaleTimeString()}</td>
             <td class="py-4 px-6 text-blue-300 font-bold">${h.symbol}</td>
@@ -380,10 +541,19 @@ app.get('/', (req, res) => {
                 <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${h.signal === 'LONG' ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'}">
                     ${h.estadoText}
                 </span>
+                ${obs}
             </td>
-            <td class="py-4 px-6 text-gray-300 font-mono text-sm">${h.tangente.toFixed(4)}</td>
+            <td class="py-4 px-6 text-gray-300 font-mono text-sm">
+                ${h.tangente.toFixed(4)}
+                <!-- Columna "Observación (by Ditox)" está integrada visualmente aquí o en una nueva columna si se prefiere. 
+                     El usuario pidió "exactamente en una última columna". Vamos a agregar esa columna en el thead y aquí. -->
+            </td>
+            <td class="py-4 px-6 text-gray-400 text-xs ditox-column hidden">
+                ${h.observation || 'Ninguna'}
+                ${adminControls}
+            </td>
         </tr>
-    `).join('');
+    `}).join('');
 
     const html = `
 <!DOCTYPE html>
@@ -436,6 +606,8 @@ app.get('/', (req, res) => {
                 <button onclick="document.getElementById('modal-info').showModal()" class="text-sm text-gray-400 hover:text-white transition-colors">¿Qué es?</button>
                 <div class="h-4 w-px bg-gray-700"></div>
                 <button onclick="document.getElementById('modal-alert').showModal()" class="text-sm text-red-400 hover:text-red-300 transition-colors">⚠️ Disclaimer</button>
+                <div class="h-4 w-px bg-gray-700"></div>
+                <button onclick="toggleDitoxMode()" class="text-sm text-purple-400 hover:text-purple-300 transition-colors bg-purple-900/20 px-3 py-1 rounded border border-purple-500/20">Soy Ditox</button>
             </div>
         </header>
 
@@ -463,10 +635,11 @@ app.get('/', (req, res) => {
                             <th class="py-4 px-6 font-semibold">TF</th>
                             <th class="py-4 px-6 font-semibold">Señal / Estado</th>
                             <th class="py-4 px-6 font-semibold">Tangente (RSI22 Suav)</th>
+                            <th class="py-4 px-6 font-semibold ditox-column hidden">Observación (by Ditox)</th>
                         </tr>
                     </thead>
                     <tbody class="text-sm divide-y divide-gray-700/50">
-                        ${historyRows.length ? historyRows : '<tr><td colspan="5" class="py-8 text-center text-gray-500 italic">Esperando primeras señales del mercado...</td></tr>'}
+                        ${historyRows.length ? historyRows : '<tr><td colspan="6" class="py-8 text-center text-gray-500 italic">Esperando primeras señales del mercado...</td></tr>'}
                     </tbody>
                 </table>
             </div>
@@ -498,6 +671,10 @@ app.get('/', (req, res) => {
                         <li class="bg-green-900/20 p-3 rounded-lg border border-green-500/30">
                             <strong class="text-green-400 block mb-1">🍏 En terreno de...:</strong> 
                             El mercado se calmó y probablemente esté a puertas de dar otro movimiento; el movimiento anterior se desaceleró y puede cambiar de dirección.
+                        </li>
+                        <li class="bg-gray-800/50 p-3 rounded-lg border border-gray-600/30">
+                            <strong class="text-gray-400 block mb-1">🦀 Indecisión:</strong>
+                            El mercado no habla claro, lo mejor es abstenerse.
                         </li>
                     </ul>
                 </div>
@@ -565,6 +742,76 @@ app.get('/', (req, res) => {
             document.getElementById('review-status').textContent = status;
             document.getElementById('review-emoji').textContent = emoji;
             document.getElementById('modal-review').showModal();
+        }
+
+        // --- DITOX ADMIN MODE ---
+        function toggleDitoxMode() {
+            const current = localStorage.getItem('isDitox');
+            if (current === 'true') {
+                // Logout
+                localStorage.removeItem('isDitox');
+                location.reload();
+            } else {
+                // Login
+                const pwd = prompt("Contraseña de Admin:");
+                if (pwd === "awd ") { // "awd " con espacio
+                    localStorage.setItem('isDitox', 'true');
+                    location.reload();
+                } else {
+                    alert("Contraseña incorrecta");
+                }
+            }
+        }
+
+        // Al cargar, verificar modo admin
+        document.addEventListener('DOMContentLoaded', () => {
+            const isDitox = localStorage.getItem('isDitox') === 'true';
+            if (isDitox) {
+                // Mostrar columnas y controles ocultos
+                document.querySelectorAll('.ditox-column').forEach(el => el.classList.remove('hidden'));
+                document.querySelectorAll('.ditox-admin').forEach(el => el.classList.remove('hidden'));
+                
+                // Cambiar texto de botón
+                const btn = document.querySelector('button[onclick="toggleDitoxMode()"]');
+                if(btn) {
+                    btn.textContent = "Salir Modo Ditox";
+                    btn.classList.add("bg-red-900/20", "border-red-500/20");
+                }
+            }
+        });
+
+        async function updateSignal(id) {
+            const select = document.getElementById('obs-select-' + id);
+            const val = select.value;
+            if (!val) {
+                alert("Selecciona una observación primero.");
+                return;
+            }
+
+            // Confimación eliminada a petición del usuario
+            // if (!confirm('¿Actualizar reporte con: "' + val + '"? Esto editará el mensaje de Telegram.')) return;
+
+            try {
+                const res = await fetch('/admin/update-signal', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        password: 'awd ', // Enviamos auth
+                        signalId: id,
+                        observationType: val
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert("Reporte actualizado exitosamente.");
+                    location.reload();
+                } else {
+                    alert("Error: " + data.message);
+                }
+            } catch (e) {
+                console.error(e);
+                alert("Error de red al actualizar.");
+            }
         }
     </script>
 </body>
