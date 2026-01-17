@@ -17,8 +17,8 @@ function loadUsers() {
             const data = fs.readFileSync(USERS_FILE, 'utf8');
             const users = JSON.parse(data);
             if (Array.isArray(users)) {
-                subscribedUsers = new Set(users);
-                console.log(`👥 Usuarios cargados: ${subscribedUsers.size}`);
+                subscribedUsers = new Set(users.map(String));
+                console.log(`👥 Usuarios cargados: ${subscribedUsers.size} (${[...subscribedUsers].join(', ')})`);
             }
         } catch (e) {
             console.error('Error cargando users.json:', e);
@@ -74,8 +74,8 @@ if (token && token !== 'your_telegram_bot_token_here') {
     console.warn('TELEGRAM_TOKEN no configurado. El bot no funcionará.');
 }
 
-const TARGET_GROUP_ID = '-1003055730763';
-const THREAD_ID = process.env.TELEGRAM_THREAD_ID;
+const TARGET_GROUP_ID = process.env.TELEGRAM_REPORT_GROUP_ID || '-1003055730763';
+const THREAD_ID = process.env.TELEGRAM_THREAD_ID || '15766';
 
 let estadoAlertas = {};
 let history = [];
@@ -186,28 +186,32 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
 // --- 4. TELEGRAM BOT LOGIC ---
 
 // Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
+// Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
 async function enviarTelegram(message) {
     if (!bot) return;
 
+    // 1. Obtener IDs del .env (TELEGRAM_CHAT_ID puede ser una lista separada por comas)
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
     const envIds = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
-    const allRecipients = new Set([...envIds, ...subscribedUsers]);
+    // 2. Combinar con usuarios suscritos (desde users.json / Set)
+    // 3. Asegurar que el grupo objetivo esté siempre en la lista
+    const allRecipients = new Set([...envIds, ...subscribedUsers, TARGET_GROUP_ID]);
 
-    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios.`);
+    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios: ${[...allRecipients].join(', ')}`);
 
-    const sentMessages = []; // Array de { chatId, messageId }
+    const sentMessages = [];
 
     for (const chatId of allRecipients) {
         try {
             const options = {};
-            // Comparación robusta
+            // Solo enviar thread_id si es el grupo objetivo
             if (String(chatId).trim() === String(TARGET_GROUP_ID).trim() && THREAD_ID) {
                 options.message_thread_id = parseInt(THREAD_ID);
             }
 
             const sentMsg = await bot.sendMessage(chatId, message, options);
-            console.log(`✅ Mensaje enviado a: ${chatId} (Thread: ${options.message_thread_id || 'N/A'}) - MsgID: ${sentMsg.message_id}`);
+            console.log(`✅ Enviado a: ${chatId} (Thread: ${options.message_thread_id || 'N/A'})`);
 
             sentMessages.push({
                 chatId: chatId,
@@ -293,6 +297,7 @@ if (bot) {
 
     bot.onText(/\/report(.+)/, async (msg, match) => {
         const chatId = msg.chat.id;
+        saveUser(chatId); // Suscribir automáticamente a quien pida reportes
         const threadId = msg.message_thread_id; // Thread desde donde se pide
         const rawSymbol = match[1].trim().toUpperCase();
 
@@ -340,7 +345,14 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
         }
     });
 
-    console.log('Bot escuchando comandos /report...');
+    // CAPTURA GLOBAL: Guardar ID de CUALQUIER persona que escriba al bot
+    bot.on('message', (msg) => {
+        if (msg.chat && msg.chat.id) {
+            saveUser(msg.chat.id);
+        }
+    });
+
+    console.log('Bot escuchando comandos y capturando usuarios...');
 }
 
 // Endpoint ADMIN para actualizar señal
