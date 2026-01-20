@@ -44,17 +44,18 @@ loadUsers();
 
 // --- 1. CONFIGURACIÓN DINÁMICA ---
 const SYMBOLS = [
-    'BTCUSDT',
-    'ETHUSDT',
-    'SOLUSDT',
-    'DOGEUSDT',
-    'AVAXUSDT',
-    'ADAUSDT',
-    'RENDERUSDT',
-    'NEARUSDT',
-    'WLDUSDT' // User mentioned reportRNDR, so RENDERUSDT is likely correct for RNDR symbol mapping
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', // Large Caps
+    'DOGEUSDT', 'AVAXUSDT', 'ADAUSDT', 'TRXUSDT', // Mid Caps
+    'RENDERUSDT', 'NEARUSDT', 'WLDUSDT', 'SUIUSDT' // Small Caps
 ];
-const INTERVALS = ['2h']; // Eliminado '1h'
+
+const CATEGORIES = {
+    'Large Caps': ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'],
+    'Mid Caps': ['DOGEUSDT', 'AVAXUSDT', 'ADAUSDT', 'TRXUSDT'],
+    'Small Caps': ['RENDERUSDT', 'NEARUSDT', 'WLDUSDT', 'SUIUSDT']
+};
+
+const INTERVALS = ['2h'];
 const CHECK_INTERVAL_MS = 60000;
 const REQUEST_DELAY_MS = 250;
 
@@ -79,6 +80,20 @@ const THREAD_ID = process.env.TELEGRAM_THREAD_ID || '15766';
 
 let estadoAlertas = {};
 let history = [];
+let terrainAlertsTracker = {
+    'LONG': [], // { symbol, timestamp }
+    'SHORT': [],
+    lastConsolidatedAlert: { 'LONG': 0, 'SHORT': 0 }
+};
+let marketSummary = {
+    rocketAngle: -90,
+    rocketColor: 'rgb(156, 163, 175)',
+    dominantState: 'Calculando...',
+    terrainNote: 'Indecisión (No operar)',
+    saturation: 0,
+    opacity: 0.5,
+    fireIntensity: 0
+};
 
 // --- 2. LÓGICA DE DATOS (Binance API) ---
 async function fetchData(symbol, interval, limit = 100) {
@@ -141,18 +156,37 @@ function calcularIndicadores(closes) {
 }
 
 // Helper para determinar Estado y Emojis
-function obtenerEstado(tangente, curveTrend) {
-    if (tangente > 1) return { text: "LONG en euforia, no buscar SHORT", emoji: "🚀", color: "text-purple-400" };
-    if (tangente > 0.10) return { text: "LONG en curso...", emoji: "🟢", color: "text-green-400" };
+function obtenerEstado(tangente, curveTrend, symbol) {
+    if (tangente > 1) return { text: "LONG en euforia, no buscar SHORT", emoji: "🚀", color: "text-purple-400", weight: -10 };
+    if (tangente > 0.10) return { text: "LONG en curso...", emoji: "🟢", color: "text-green-400", weight: -5 };
 
-    if (tangente < -1) return { text: "SHORT en euforia, no buscar LONG", emoji: "🩸", color: "text-red-500" };
-    if (tangente < -0.10) return { text: "SHORT en curso...", emoji: "🔴", color: "text-red-400" };
+    if (tangente < -1) return { text: "SHORT en euforia, no buscar LONG", emoji: "🩸", color: "text-red-500", weight: 10 };
+    if (tangente < -0.10) return { text: "SHORT en curso...", emoji: "🔴", color: "text-red-400", weight: 5 };
 
     // Rango -0.10 a 0.10
-    if (curveTrend === 'DOWN') return { text: "En terreno de LONG", emoji: "🍏", color: "text-lime-400" };
-    if (curveTrend === 'UP') return { text: "En terreno de SHORT", emoji: "🍎", color: "text-orange-400" };
+    if (curveTrend === 'DOWN') {
+        trackTerrain('LONG', symbol);
+        return { text: "En terreno de LONG", emoji: "🍏", color: "text-lime-400", weight: 0, terrain: 'LONG' };
+    }
+    if (curveTrend === 'UP') {
+        trackTerrain('SHORT', symbol);
+        return { text: "En terreno de SHORT", emoji: "🍎", color: "text-orange-400", weight: 0, terrain: 'SHORT' };
+    }
 
-    return { text: "Indecisión (No operar)", emoji: "🦀", color: "text-gray-400" };
+    return { text: "Indecisión (No operar)", emoji: "🦀", color: "text-gray-400", weight: 0 };
+}
+
+function trackTerrain(type, symbol) {
+    const now = Date.now();
+    const list = terrainAlertsTracker[type];
+
+    // Check if already tracking this symbol for this type in the last hour
+    const existing = list.find(item => item.symbol === symbol);
+    if (existing) {
+        existing.timestamp = now; // Update timestamp to keep it alive
+    } else {
+        list.push({ symbol, timestamp: now });
+    }
 }
 
 function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
@@ -345,6 +379,97 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
         }
     });
 
+    bot.onText(/\/reportALL/, async (msg) => {
+        const chatId = msg.chat.id;
+        saveUser(chatId);
+        const threadId = msg.message_thread_id;
+        const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
+
+        const reportMsg = `📊 REPORTE GENERAL - ${dateStr}\n\nEstado Dominante: ${marketSummary.dominantState}\n${marketSummary.terrainNote !== "Indecisión (No operar)" ? `Tendencia: ${marketSummary.terrainNote} 🚀` : ''}\n\n¡Sigue operando con responsabilidad! 🔥`;
+
+        bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+    });
+
+    bot.onText(/\/simulate_triple_terrain/, async (msg) => {
+        const chatId = msg.chat.id;
+        bot.sendMessage(chatId, "🧪 Iniciando simulación de 3 terrenos de LONG...");
+        trackTerrain('LONG', 'BTCUSDT');
+        trackTerrain('LONG', 'ETHUSDT');
+        trackTerrain('LONG', 'SOLUSDT');
+        await checkConsolidatedAlerts();
+        bot.sendMessage(chatId, "✅ Simulación ejecutada.");
+    });
+
+    app.get('/simulate-triple-terrain', async (req, res) => {
+        trackTerrain('LONG', 'BTCUSDT');
+        trackTerrain('LONG', 'ETHUSDT');
+        trackTerrain('LONG', 'SOLUSDT');
+        await checkConsolidatedAlerts();
+        res.send("Simulación de triple terreno enviada.");
+    });
+
+    bot.onText(/\/simulate_long_terrain/, async (msg) => {
+        const chatId = msg.chat.id;
+        bot.sendMessage(chatId, "🧪 Simulando 'Terreno de LONG' en el panel...");
+
+        // Forzar estado en el objeto global para previsualización
+        marketSummary.rocketAngle = -45;
+        marketSummary.dominantState = "En terreno de LONG";
+        marketSummary.rocketColor = "rgb(74, 222, 128)"; // Green
+        marketSummary.fireIntensity = 0.8;
+        marketSummary.saturation = 1;
+        marketSummary.opacity = 1;
+
+        bot.sendMessage(chatId, "✅ Panel actualizado. Recarga para ver (o espera al auto-refresh).");
+    });
+
+    app.get('/simulate-long-terrain', (req, res) => {
+        marketSummary.rocketAngle = -45;
+        marketSummary.dominantState = "En terreno de LONG";
+        marketSummary.rocketColor = "rgb(74, 222, 128)";
+        marketSummary.fireIntensity = 0.8;
+        marketSummary.saturation = 1;
+        marketSummary.opacity = 1;
+        res.send("Simulación de Terreno de LONG activada en el panel.");
+    });
+
+    bot.onText(/\/simulate_long_euphoria/, async (msg) => {
+        const chatId = msg.chat.id;
+        bot.sendMessage(chatId, "🧪 Simulando 'LONG en Euforia'...");
+        marketSummary.rocketAngle = -90;
+        marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
+        marketSummary.rocketColor = "rgb(74, 222, 128)";
+        marketSummary.fireIntensity = 1;
+        marketSummary.saturation = 1;
+        marketSummary.opacity = 1;
+        bot.sendMessage(chatId, "✅ Panel actualizado a Euforia LONG.");
+    });
+
+    bot.onText(/\/simulate_short_euphoria/, async (msg) => {
+        const chatId = msg.chat.id;
+        bot.sendMessage(chatId, "🧪 Simulando 'SHORT en Euforia'...");
+        marketSummary.rocketAngle = 90;
+        marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
+        marketSummary.rocketColor = "rgb(248, 113, 113)";
+        marketSummary.fireIntensity = 0;
+        marketSummary.saturation = 0.4;
+        marketSummary.opacity = 0.4;
+        bot.sendMessage(chatId, "✅ Panel actualizado a Euforia SHORT.");
+    });
+
+    app.get('/simulate-long-euphoria', (req, res) => {
+        marketSummary.rocketAngle = -90;
+        marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
+        marketSummary.fireIntensity = 1;
+        res.send("Panel en Euforia LONG.");
+    });
+
+    app.get('/simulate-short-euphoria', (req, res) => {
+        marketSummary.rocketAngle = 90;
+        marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
+        res.send("Panel en Euforia SHORT.");
+    });
+
     // CAPTURA GLOBAL: Guardar ID de CUALQUIER persona que escriba al bot
     bot.on('message', (msg) => {
         if (msg.chat && msg.chat.id) {
@@ -432,8 +557,19 @@ app.post('/admin/update-signal', async (req, res) => {
 async function procesarMercado() {
     console.log(`[${new Date().toLocaleTimeString()}] Escaneando...`);
 
+    let totalWeight = 0;
+    let counts = {};
+    let longTerrainCount = 0;
+    let shortTerrainCount = 0;
+
+    // Limpiar trackings viejos (>1h)
+    const now = Date.now();
+    const oneHour = 3600000;
+    terrainAlertsTracker.LONG = terrainAlertsTracker.LONG.filter(t => now - t.timestamp < oneHour);
+    terrainAlertsTracker.SHORT = terrainAlertsTracker.SHORT.filter(t => now - t.timestamp < oneHour);
+
     for (const symbol of SYMBOLS) {
-        for (const interval of INTERVALS) { // Solo 2h ahora
+        for (const interval of INTERVALS) {
             await new Promise(r => setTimeout(r, REQUEST_DELAY_MS));
 
             const marketData = await fetchData(symbol, interval);
@@ -444,12 +580,14 @@ async function procesarMercado() {
             if (!indicadores) continue;
 
             const lastCandleTime = closeTimes[closeTimes.length - 1];
-            const signal = evaluarAlertas(symbol, interval, indicadores, lastCandleTime);
+            const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend, symbol);
 
-            // Guardar en alerta para mostrar en UI aunque no sea cross zero
-            const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend);
+            // Resumen de mercado
+            totalWeight += estadoInfo.weight || 0;
+            counts[estadoInfo.text] = (counts[estadoInfo.text] || 0) + 1;
+            if (estadoInfo.terrain === 'LONG') longTerrainCount++;
+            if (estadoInfo.terrain === 'SHORT') shortTerrainCount++;
 
-            // Actualizamos estadoAlertas con más info para la UI
             const key = `${symbol}_${interval}`;
             if (!estadoAlertas[key]) estadoAlertas[key] = {};
             estadoAlertas[key].currentStateText = estadoInfo.text;
@@ -457,27 +595,111 @@ async function procesarMercado() {
             estadoAlertas[key].currentPrice = indicadores.currentPrice;
             estadoAlertas[key].tangente = indicadores.tangente;
 
+            const signal = evaluarAlertas(symbol, interval, indicadores, lastCandleTime);
 
             if (signal) {
-                const message = `🚀 ALERTA DITOX
+                // Si la señal es "En terreno de...", la ignoramos aquí (se manejará consolidada)
+                if (estadoInfo.text.includes("En terreno de")) {
+                    console.log(`Skipping individual terrain alert for ${symbol}`);
+                } else {
+                    const message = `🚀 ALERTA DITOX\n\n💎 ${symbol}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+                    const sentMessages = await enviarTelegram(message);
 
-💎 ${symbol}
+                    history.unshift({
+                        time: new Date().toISOString(),
+                        symbol, interval, signal,
+                        estadoText: estadoInfo.text,
+                        tangente: indicadores.tangente,
+                        sentMessages: sentMessages || [],
+                        observation: null,
+                        id: Date.now()
+                    });
+                    if (history.length > 20) history.pop();
+                }
+            }
+        }
+    }
 
-⏱ Temporalidad: ${interval}
-📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+    // Calcular Resumen
+    const maxPossibleWeight = SYMBOLS.length * 10;
+    marketSummary.rocketAngle = (totalWeight / maxPossibleWeight) * 90;
 
-                const sentMessages = await enviarTelegram(message);
+    // Color cohete
+    if (longTerrainCount > 0 || shortTerrainCount > 0) {
+        const totalTerrain = longTerrainCount + shortTerrainCount;
+        const greenRatio = longTerrainCount / totalTerrain;
+        const red = Math.floor(255 * (1 - greenRatio));
+        const green = Math.floor(255 * greenRatio);
+        marketSummary.rocketColor = `rgb(${red}, ${green}, 0)`;
+        marketSummary.terrainNote = longTerrainCount >= shortTerrainCount ? "En terreno de LONG" : "En terreno de SHORT";
+    } else {
+        marketSummary.rocketColor = 'rgb(156, 163, 175)'; // Gray
+        marketSummary.terrainNote = "Indecisión (No operar)";
+    }
 
-                history.unshift({
-                    time: new Date().toISOString(),
-                    symbol, interval, signal,
-                    estadoText: estadoInfo.text,
-                    tangente: indicadores.tangente,
-                    sentMessages: sentMessages || [],
-                    observation: null,
-                    id: Date.now()
-                });
-                if (history.length > 20) history.pop();
+    // --- Lógica Avanzada del Cohete (Reversada según usuario) ---
+    const val = marketSummary.rocketAngle;
+
+    // Fuego (Bullish < -15) - AHORA EN LA ZONA VERDE
+    if (val <= -15) {
+        marketSummary.fireIntensity = (val - (-15)) / ((-90) - (-15));
+    } else {
+        marketSummary.fireIntensity = 0;
+    }
+
+    // Saturation y Opacidad (Bearish > 15) - AHORA EN LA ZONA ROJA
+    if (val >= 15) {
+        const factor = (val - 90) / (15 - 90);
+        marketSummary.saturation = factor;
+        marketSummary.opacity = 0.4 + (factor * 0.6);
+    } else {
+        marketSummary.saturation = 1;
+        marketSummary.opacity = 1;
+    }
+
+    // --- Mapeo de Estado Dominante (Mega Título) y Color Dinámico ---
+    if (marketSummary.terrainNote && marketSummary.terrainNote !== "Indecisión (No operar)") {
+        marketSummary.dominantState = marketSummary.terrainNote;
+    } else {
+        if (val >= 45) marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
+        else if (val > 15) marketSummary.dominantState = "Short en curso...";
+        else if (val <= -45) marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
+        else if (val < -15) marketSummary.dominantState = "Long en curso...";
+        else marketSummary.dominantState = "Indecisión";
+    }
+
+    // Calcular Color Dinámico (Interpolación RGB)
+    // Gris: (156, 163, 175)
+    // Verde: (74, 222, 128) -> Usar para val < 0
+    // Rojo: (248, 113, 113) -> Usar para val > 0
+    const startColor = [156, 163, 175];
+    const targetColor = val < 0 ? [74, 222, 128] : [248, 113, 113];
+    const absVal = Math.min(Math.abs(val) / 90, 1);
+
+    const r = Math.floor(startColor[0] + (targetColor[0] - startColor[0]) * absVal);
+    const g = Math.floor(startColor[1] + (targetColor[1] - startColor[1]) * absVal);
+    const b = Math.floor(startColor[2] + (targetColor[2] - startColor[2]) * absVal);
+    marketSummary.rocketColor = `rgb(${r}, ${g}, ${b})`;
+
+    // Alertas Consolidadas
+    await checkConsolidatedAlerts();
+}
+
+async function checkConsolidatedAlerts() {
+    const now = Date.now();
+    const oneHour = 3600000;
+
+    for (const type of ['LONG', 'SHORT']) {
+        const hits = terrainAlertsTracker[type];
+        if (hits.length >= 3) {
+            if (now - terrainAlertsTracker.lastConsolidatedAlert[type] > oneHour) {
+                const dominantPairs = hits.map(h => h.symbol.replace('USDT', '')).join(', ');
+                const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
+
+                const message = `🚨 ALERTA DE MERCADO DITOX - ${dateStr}\n\nEn terreno de ${type},\nA TRADEAR! 🚀🔥\n\nDominantes: ${dominantPairs}`;
+
+                await enviarTelegram(message);
+                terrainAlertsTracker.lastConsolidatedAlert[type] = now;
             }
         }
     }
@@ -489,18 +711,13 @@ procesarMercado();
 
 // --- 6. DASHBOARD FRONTEND ---
 app.get('/', (req, res) => {
-    const cardsHtml = SYMBOLS.map(s => {
+    const generateCards = (symbols) => symbols.map(s => {
         const i = '2h';
         const key = `${s}_${i}`;
         const estado = estadoAlertas[key] || {};
         const price = estado.currentPrice ? `$${estado.currentPrice}` : 'Cargando...';
         const statusText = estado.currentStateText || 'Esperando datos...';
         const statusEmoji = estado.currentStateEmoji || '⏳';
-
-        // Determinar color basado en el texto del estado (algo sucio pero funcional rápido)
-        // O mejor re-usar obtenerEstado si tuviéramos la tangente aquí guardada.
-        // Usamos una clase genérica y luego JS en cliente o clases condicionales.
-        // Simplificación: texto blanco/gris si no hay data.
 
         return `
             <div data-symbol="${s}" data-price="${price}" data-status="${statusText} ${statusEmoji}" 
@@ -526,6 +743,10 @@ app.get('/', (req, res) => {
             </div>
          `;
     }).join('');
+
+    const largeCapsHtml = generateCards(CATEGORIES['Large Caps']);
+    const midCapsHtml = generateCards(CATEGORIES['Mid Caps']);
+    const smallCapsHtml = generateCards(CATEGORIES['Small Caps']);
 
     const historyRows = history.map(h => {
         const obs = h.observation ? `<span class="block text-xs text-yellow-400 mt-1">📝 ${h.observation}</span>` : '';
@@ -597,11 +818,28 @@ app.get('/', (req, res) => {
         ::-webkit-scrollbar-track { background: #1f2937; }
         ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+
+        /* Rocket Gauge Styles */
+        .gauge-container { position: relative; width: 250px; height: 440px; overflow: hidden; border-left: 4px solid #334155; margin: 0 auto; }
+        .gauge-arc { position: absolute; width: 440px; height: 440px; border-radius: 50%; left: -220px; background: conic-gradient(from 0deg, #4ade80 0deg, #facc15 90deg, #f87171 180deg); -webkit-mask: radial-gradient(circle, transparent 64%, black 65%); mask: radial-gradient(circle, transparent 64%, black 65%); }
+        .rocket-pivot { position: absolute; top: 50%; left: 0; width: 200px; height: 2px; transform-origin: left center; transition: transform 0.8s cubic-bezier(0.34, 1.56, 0.64, 1); animation: oscillate 3s infinite ease-in-out; }
+        .rocket-wrapper { position: absolute; right: 0; top: 50%; transform: translateY(-50%) rotate(45deg); display: flex; align-items: center; justify-content: center; transition: filter 0.5s ease-out; }
+        .rocket { font-size: 5rem; z-index: 2; user-select: none; }
+        .rocket-wrapper::after { content: "🔥"; position: absolute; font-size: 2rem; bottom: -18px; left: -18px; transform: rotate(135deg) scale(var(--fire-scale)); opacity: var(--fire-opacity); filter: blur(0.5px); animation: flicker 0.1s infinite alternate; z-index: 1; }
+        
+        /* Animations */
+        @keyframes flicker { from { transform: rotate(135deg) scale(calc(var(--fire-scale) * 0.9)); } to { transform: rotate(135deg) scale(calc(var(--fire-scale) * 1.1)) translateY(2px); } }
+        @keyframes oscillate { 0%, 100% { transform: translateY(-50%) translateY(0px) rotate(var(--rot-base)); } 50% { transform: translateY(-50%) translateY(5px) rotate(calc(var(--rot-base) + 2deg)); } }
+        @keyframes breathing { 0%, 100% { opacity: 1; } 50% { opacity: 0.75; } }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
+
+        .animate-fadeInUp { animation: fadeInUp 0.8s ease-out forwards; }
+        .animate-breathing { animation: breathing 3s infinite ease-in-out; }
     </style>
 </head>
 <body class="text-gray-200 min-h-screen p-4 md:p-8">
 
-    <div class="max-w-7xl mx-auto">
+    <div class="max-w-7xl mx-auto animate-fadeInUp">
         <!-- Header -->
         <header class="mb-12 flex flex-col md:flex-row justify-between items-center gap-4">
             <div class="flex items-center gap-3">
@@ -623,9 +861,65 @@ app.get('/', (req, res) => {
             </div>
         </header>
 
-        <!-- Stats Grid -->
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 mb-16">
-            ${cardsHtml}
+        <!-- Mercado Summary Section -->
+        <section class="mb-16 bg-gray-800/30 backdrop-blur-lg rounded-3xl border border-gray-700/50 p-8">
+            <h2 class="text-2xl font-bold text-white mb-8 border-b border-gray-700 pb-4 uppercase">Resumen del Mercado</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-12 items-center">
+                <!-- Left: Advanced Rocket Gauge -->
+                <div class="flex flex-col items-center">
+                    <h3 class="text-lg font-semibold text-gray-400 mb-8">¿Hacia dónde vamos?</h3>
+                    <div class="gauge-container" style="--fire-scale: ${marketSummary.fireIntensity * 1.4}; --fire-opacity: ${marketSummary.fireIntensity};">
+                        <div class="gauge-arc"></div>
+                        <div class="rocket-pivot" style="--rot-base: ${marketSummary.rocketAngle}deg; transform: translateY(-50%) rotate(${marketSummary.rocketAngle}deg);">
+                            <div class="rocket-wrapper" style="filter: grayscale(${1 - marketSummary.saturation}) opacity(${marketSummary.opacity});">
+                                <div class="rocket">🚀</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Right: Mega State -->
+                <div class="text-center md:text-left">
+                    <p class="text-gray-400 text-sm uppercase tracking-widest mb-2 font-semibold">Estado Dominante</p>
+                    <h2 class="text-5xl md:text-6xl font-black tracking-tighter leading-none transition-all duration-100 animate-breathing" 
+                        style="color: ${marketSummary.rocketColor}">
+                        ${marketSummary.dominantState.toUpperCase()}
+                    </h2>
+                </div>
+            </div>
+        </section>
+
+        <!-- Stats Grid (Categorized) -->
+        <div class="space-y-12 mb-16">
+            <section>
+                <div class="flex items-center gap-4 mb-6">
+                    <h2 class="text-2xl font-bold text-blue-400">Large Caps</h2>
+                    <div class="h-px flex-grow bg-gradient-to-r from-blue-500/50 to-transparent"></div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    ${largeCapsHtml}
+                </div>
+            </section>
+
+            <section>
+                <div class="flex items-center gap-4 mb-6">
+                    <h2 class="text-2xl font-bold text-green-400">Mid Caps</h2>
+                    <div class="h-px flex-grow bg-gradient-to-r from-green-500/50 to-transparent"></div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    ${midCapsHtml}
+                </div>
+            </section>
+
+            <section>
+                <div class="flex items-center gap-4 mb-6">
+                    <h2 class="text-2xl font-bold text-orange-400">Small Caps</h2>
+                    <div class="h-px flex-grow bg-gradient-to-r from-orange-500/50 to-transparent"></div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    ${smallCapsHtml}
+                </div>
+            </section>
         </div>
 
         <!-- Historial -->
@@ -692,8 +986,23 @@ app.get('/', (req, res) => {
                 </div>
 
                 <div>
-                    <h4 class="font-bold text-white mb-1">Su mejor atributo:</h4>
-                    <p>Avisarte cuando es buen momento de analizar, ahorrándote tiempo de estar pendiente al mercado todo el día.</p>
+                    <h4 class="font-bold text-white mb-2 text-lg">Resumen del Mercado y Cohete:</h4>
+                    <p class="text-sm mb-3">El cohete central es un indicador dinámico del sentimiento global:</p>
+                    <ul class="space-y-2 text-sm text-gray-400">
+                        <li class="flex items-start gap-2">
+                            <span class="text-white">•</span>
+                            <span><strong>Inclinación:</strong> El rango es de 90° (Bajista Extremo) a -90° (Alcista Extremo). Se entra en <strong>Euforia</strong> al superar los 45° en cualquier dirección.</span>
+                        </li>
+                        <li class="flex items-start gap-2">
+                            <span class="text-white">•</span>
+                            <span><strong>Color:</strong> Se vuelve más verde mientras más activos estén en "Terreno de LONG" y más rojo en "Terreno de SHORT".</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <div>
+                    <h4 class="font-bold text-white mb-1">Alertas Inteligentes:</h4>
+                    <p class="text-sm">Para reducir ruido, las alertas de "Terreno de..." ahora se consolidan. Solo recibirás una notificación general cuando al menos <strong class="text-white">3 activos diferentes</strong> entren en dicho terreno en un lapso de 1 hora.</p>
                 </div>
             </div>
             <div class="mt-8 text-right">
