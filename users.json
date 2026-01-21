@@ -1,1 +1,28 @@
-["6967546776","-1003055730763","1985505500","1145860451"]
+{
+  "1145860451": {
+    "id": "1145860451",
+    "username": "Usuario",
+    "preferences": []
+  },
+  "1985505500": {
+    "id": "1985505500",
+    "username": "ditox_18",
+    "preferences": [
+      "SOLUSDT",
+      "DOGEUSDT",
+      "ADAUSDT",
+      "RENDERUSDT",
+      "WLDUSDT"
+    ]
+  },
+  "6967546776": {
+    "id": "6967546776",
+    "username": "Hincha Peru",
+    "preferences": []
+  },
+  "-1003055730763": {
+    "id": "-1003055730763",
+    "username": "ditox_18",
+    "preferences": []
+  }
+}

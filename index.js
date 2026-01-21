@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const USERS_FILE = path.join(__dirname, 'users.json');
-let subscribedUsers = new Set();
+let userDatabase = {}; // { chatId: { id, username, preferences: [] } }
 
 // Cargar usuarios al inicio
 function loadUsers() {
@@ -16,9 +16,23 @@ function loadUsers() {
         try {
             const data = fs.readFileSync(USERS_FILE, 'utf8');
             const users = JSON.parse(data);
+
             if (Array.isArray(users)) {
-                subscribedUsers = new Set(users.map(String));
-                console.log(`👥 Usuarios cargados: ${subscribedUsers.size} (${[...subscribedUsers].join(', ')})`);
+                // Migración de formato viejo (Array de IDs) a nuevo formato (Objeto)
+                users.forEach(id => {
+                    const idStr = String(id);
+                    userDatabase[idStr] = {
+                        id: idStr,
+                        username: 'Usuario',
+                        preferences: [] // Por defecto solo alertas generales
+                    };
+                });
+                // Guardar migración
+                fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
+                console.log(`♻️ Migrados ${Object.keys(userDatabase).length} usuarios al nuevo formato.`);
+            } else if (typeof users === 'object') {
+                userDatabase = users;
+                console.log(`👥 Usuarios cargados: ${Object.keys(userDatabase).length}`);
             }
         } catch (e) {
             console.error('Error cargando users.json:', e);
@@ -26,14 +40,26 @@ function loadUsers() {
     }
 }
 
-function saveUser(chatId) {
-    // Convertir a string para consistencia
+function saveUser(chatId, username = 'Usuario') {
     const idStr = String(chatId);
-    if (!subscribedUsers.has(idStr)) {
-        subscribedUsers.add(idStr);
+    let changed = false;
+
+    if (!userDatabase[idStr]) {
+        userDatabase[idStr] = {
+            id: idStr,
+            username: username || 'Usuario',
+            preferences: []
+        };
+        changed = true;
+    } else if (username && userDatabase[idStr].username !== username && username !== 'Usuario') {
+        userDatabase[idStr].username = username;
+        changed = true;
+    }
+
+    if (changed) {
         try {
-            fs.writeFileSync(USERS_FILE, JSON.stringify([...subscribedUsers]));
-            console.log(`✅ Nuevo usuario suscrito: ${idStr}`);
+            fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
+            console.log(`✅ Usuario actualizado/guardado: ${idStr} (${username})`);
         } catch (e) {
             console.error('Error guardando users.json:', e);
         }
@@ -60,6 +86,7 @@ const CHECK_INTERVAL_MS = 60000;
 const REQUEST_DELAY_MS = 250;
 
 const app = express();
+app.use(express.json()); // Necesario para parsear body JSON
 const PORT = process.env.PORT || 3000;
 
 // Servir archivos estáticos (para el icono)
@@ -85,6 +112,7 @@ let terrainAlertsTracker = {
     'SHORT': [],
     lastConsolidatedAlert: { 'LONG': 0, 'SHORT': 0 }
 };
+let waitingForNickname = new Set(); // IDs de usuarios a los que les pedimos apodo
 let marketSummary = {
     rocketAngle: -90,
     rocketColor: 'rgb(156, 163, 175)',
@@ -220,33 +248,38 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
 // --- 4. TELEGRAM BOT LOGIC ---
 
 // Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
-// Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
-async function enviarTelegram(message) {
+async function enviarTelegram(message, symbol = null) {
     if (!bot) return;
 
     // 1. Obtener IDs del .env (TELEGRAM_CHAT_ID puede ser una lista separada por comas)
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
     const envIds = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
-    // 2. Combinar con usuarios suscritos (desde users.json / Set)
-    // 3. Asegurar que el grupo objetivo esté siempre en la lista
-    const allRecipients = new Set([...envIds, ...subscribedUsers, TARGET_GROUP_ID]);
+    // 2. Filtrar usuarios según preferencias si hay un símbolo específico
+    const filteredSubscribers = [];
+    for (const chatId in userDatabase) {
+        const user = userDatabase[chatId];
+        // Si no hay símbolo (alerta general), o el usuario tiene el símbolo en sus preferencias
+        if (!symbol || (user.preferences && user.preferences.includes(symbol))) {
+            filteredSubscribers.push(chatId);
+        }
+    }
 
-    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios: ${[...allRecipients].join(', ')}`);
+    // 3. Combinar con IDs de ENV y el grupo objetivo (estos siempre reciben TODO)
+    const allRecipients = new Set([...envIds, ...filteredSubscribers, TARGET_GROUP_ID]);
+
+    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios (Símbolo: ${symbol || 'GENERAL'})`);
 
     const sentMessages = [];
 
     for (const chatId of allRecipients) {
         try {
             const options = {};
-            // Solo enviar thread_id si es el grupo objetivo
             if (String(chatId).trim() === String(TARGET_GROUP_ID).trim() && THREAD_ID) {
                 options.message_thread_id = parseInt(THREAD_ID);
             }
 
             const sentMsg = await bot.sendMessage(chatId, message, options);
-            console.log(`✅ Enviado a: ${chatId} (Thread: ${options.message_thread_id || 'N/A'})`);
-
             sentMessages.push({
                 chatId: chatId,
                 messageId: sentMsg.message_id
@@ -259,65 +292,66 @@ async function enviarTelegram(message) {
     return sentMessages;
 }
 
-// Endpoint de prueba
-app.get('/test-alert', async (req, res) => {
-    const msg = `🧪 ALERTA DE PRUEBA
-    
-Si ves esto en el HILO, funciona correctamente.
-Si ves esto en privado, también funciona.`;
+// --- 4. TELEGRAM BOT LOGIC & SIMULATION HELPERS ---
 
-    await enviarTelegram(msg);
-    res.send('Alerta de prueba enviada a todos los destinatarios.');
-});
-
-// Endpoint para SIMULAR una señal de mercado (LONG/SHORT)
-app.get('/simulate/:symbol/:type', async (req, res) => {
-    const { symbol, type } = req.params;
-    const interval = '2h';
+// Helper para simular señales (limpieza y reutilización)
+async function simulateSignalEffect(symbol, type, options = {}) {
     const sUpper = symbol.toUpperCase();
+    const tUpper = type.toUpperCase();
+    const interval = '2h';
+    let text = "Desconocido", emoji = "❓", tangente = 0, curveTrend = 'NEUTRAL';
 
-    // Valores falsos para forzar la señal
-    let tangente = 0;
-    let curveTrend = 'NEUTRAL';
-    let emoji = '❓';
-    let text = 'Desconocido';
-
-    if (type.toUpperCase() === 'LONG') {
-        tangente = 0.05; // Dentro del rango -0.10 a 0.10
-        curveTrend = 'DOWN'; // Reversión alcista
-        text = "En terreno de LONG";
-        emoji = "🍏";
-    } else if (type.toUpperCase() === 'SHORT') {
-        tangente = -0.05;
+    if (tUpper.includes('LONG')) {
+        tangente = tUpper.includes('EUPHORIA') ? 1.5 : 0.05;
+        curveTrend = 'DOWN';
+        text = tUpper.includes('EUPHORIA') ? "LONG en euforia, no buscar SHORT" : "En terreno de LONG";
+        emoji = tUpper.includes('EUPHORIA') ? "🚀" : "🍏";
+    } else if (tUpper.includes('SHORT')) {
+        tangente = tUpper.includes('EUPHORIA') ? -1.5 : -0.05;
         curveTrend = 'UP';
-        text = "En terreno de SHORT";
-        emoji = "🍎";
+        text = tUpper.includes('EUPHORIA') ? "SHORT en euforia, no buscar LONG" : "En terreno de SHORT";
+        emoji = tUpper.includes('EUPHORIA') ? "🩸" : "�";
     }
 
-    const message = `🚀 ALERTA DITOX (SIMULACRO)
+    if (options.trackTerrain) trackTerrain(tUpper.includes('LONG') ? 'LONG' : 'SHORT', sUpper);
 
-💎 ${sUpper}
+    if (options.updatePanel) {
+        marketSummary.rocketAngle = tUpper.includes('LONG') ? (tUpper.includes('EUPHORIA') ? -90 : -45) : (tUpper.includes('EUPHORIA') ? 90 : 45);
+        marketSummary.dominantState = text;
+        marketSummary.rocketColor = tUpper.includes('LONG') ? "rgb(74, 222, 128)" : "rgb(248, 113, 113)";
+        marketSummary.fireIntensity = tUpper.includes('LONG') ? (tUpper.includes('EUPHORIA') ? 1 : 0.8) : 0;
+        marketSummary.opacity = tUpper.includes('LONG') ? 1 : 0.6;
+        marketSummary.saturation = tUpper.includes('LONG') ? 1 : 0.4;
+    }
 
-⏱ Temporalidad: ${interval}
-📈 Estado: ${text} ${emoji}`;
+    const message = `🚀 ALERTA DITOX (SIMULACRO)\n\n💎 ${sUpper}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${text} ${emoji}`;
+    const sentMessages = await enviarTelegram(message, sUpper);
 
-    const sentMessages = await enviarTelegram(message);
-
-    // También agregamos al historial para que se vea en el dashboard
     history.unshift({
         time: new Date().toISOString(),
-        symbol: sUpper,
-        interval,
-        signal: type.toUpperCase(),
+        symbol: sUpper, interval, signal: tUpper.includes('LONG') ? 'LONG' : 'SHORT',
         estadoText: text,
-        tangente: tangente,
+        estadoEmoji: emoji,
+        tangente,
         sentMessages: sentMessages || [],
         observation: null,
-        id: Date.now() // Unique ID for finding this signal later
+        id: Date.now()
     });
     if (history.length > 20) history.pop();
+    return message;
+}
 
-    res.send(`Simulacro de ${type} para ${sUpper} enviado.`);
+// Endpoint de prueba simple
+app.get('/test-alert', async (req, res) => {
+    await enviarTelegram(`🧪 ALERTA DE PRUEBA\n\nSi ves esto, la conexión con Telegram es correcta.`);
+    res.send('Prueba enviada.');
+});
+
+// Endpoint GENÉRICO para SIMULAR
+app.get('/simulate/:symbol/:type', async (req, res) => {
+    const { symbol, type } = req.params;
+    await simulateSignalEffect(symbol, type, { updatePanel: true });
+    res.send(`Simulacro de ${type} para ${symbol} ejecutado.`);
 });
 
 // Escuchar comandos
@@ -325,13 +359,18 @@ if (bot) {
     // Comando /start
     bot.onText(/\/start/, (msg) => {
         const chatId = msg.chat.id;
-        saveUser(chatId);
-        bot.sendMessage(chatId, "👋 ¡Bienvenido a IndicAlerts Ditox!\n\nEstás suscrito a las alertas automáticas. También puedes usar comandos como /reportBTC o /reportSOL para ver el estado actual.\n\n Recuerda: Este bot no hace trading, solo resume la situación del mercado y envía alertas.");
+        const name = msg.from.username || msg.from.first_name;
+
+        saveUser(chatId, name);
+
+        bot.sendMessage(chatId, `👋 ¡Bienvenido a IndicAlerts Ditox! ${name ? `Hola ${name}.` : ''}\n\nEstás suscrito a las alertas automáticas. Para mejorar tu experiencia, **por favor responde a este mensaje con un apodo o nombre** que prefieras que usemos en el panel.`);
+        waitingForNickname.add(chatId);
     });
 
     bot.onText(/\/reportALL/i, async (msg) => {
         const chatId = msg.chat.id;
-        saveUser(chatId);
+        const username = msg.from.username || msg.from.first_name || 'Usuario';
+        saveUser(chatId, username);
         const threadId = msg.message_thread_id;
         const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
 
@@ -342,7 +381,8 @@ if (bot) {
 
     bot.onText(/\/report(?!\s*ALL\b)(.+)/i, async (msg, match) => {
         const chatId = msg.chat.id;
-        saveUser(chatId); // Suscribir automáticamente a quien pida reportes
+        const username = msg.from.username || msg.from.first_name || 'Usuario';
+        saveUser(chatId, username); // Suscribir automáticamente a quien pida reportes
         const threadId = msg.message_thread_id; // Thread desde donde se pide
         const rawSymbol = match[1].trim().toUpperCase();
         if (rawSymbol === 'ALL') return; // Salvaguarda extra
@@ -392,98 +432,70 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
     });
 
 
-    bot.onText(/\/simulate_triple_terrain/, async (msg) => {
-        const chatId = msg.chat.id;
-        bot.sendMessage(chatId, "🧪 Iniciando simulación de 3 terrenos de LONG...");
-        trackTerrain('LONG', 'BTCUSDT');
-        trackTerrain('LONG', 'ETHUSDT');
-        trackTerrain('LONG', 'SOLUSDT');
+    bot.onText(/\/simulate_triple_(long|short)/i, async (msg, match) => {
+        const type = match[1].toUpperCase();
+        bot.sendMessage(msg.chat.id, `🧪 Iniciando simulación de 3 terrenos de ${type}...`);
+
+        const simSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        for (const s of simSymbols) {
+            await simulateSignalEffect(s, type, { trackTerrain: true });
+        }
+
         await checkConsolidatedAlerts();
-        bot.sendMessage(chatId, "✅ Simulación ejecutada.");
+        bot.sendMessage(msg.chat.id, `✅ Simulación de ${type} ejecutada.`);
     });
 
     app.get('/simulate-triple-terrain', async (req, res) => {
-        trackTerrain('LONG', 'BTCUSDT');
-        trackTerrain('LONG', 'ETHUSDT');
-        trackTerrain('LONG', 'SOLUSDT');
+        const type = req.query.type?.toUpperCase() === 'SHORT' ? 'SHORT' : 'LONG';
+        const simSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        for (const s of simSymbols) {
+            await simulateSignalEffect(s, type, { trackTerrain: true });
+        }
         await checkConsolidatedAlerts();
-        res.send("Simulación de triple terreno enviada.");
+        res.send(`Simulación de triple terreno de ${type} enviada.`);
     });
 
-    bot.onText(/\/simulate_long_terrain/, async (msg) => {
-        const chatId = msg.chat.id;
-        bot.sendMessage(chatId, "🧪 Simulando 'Terreno de LONG' en el panel...");
-
-        // Forzar estado en el objeto global para previsualización
-        marketSummary.rocketAngle = -45;
-        marketSummary.dominantState = "En terreno de LONG";
-        marketSummary.rocketColor = "rgb(74, 222, 128)"; // Green
-        marketSummary.fireIntensity = 0.8;
-        marketSummary.saturation = 1;
-        marketSummary.opacity = 1;
-
-        bot.sendMessage(chatId, "✅ Panel actualizado. Recarga para ver (o espera al auto-refresh).");
-    });
-
-    app.get('/simulate-long-terrain', (req, res) => {
-        marketSummary.rocketAngle = -45;
-        marketSummary.dominantState = "En terreno de LONG";
-        marketSummary.rocketColor = "rgb(74, 222, 128)";
-        marketSummary.fireIntensity = 0.8;
-        marketSummary.saturation = 1;
-        marketSummary.opacity = 1;
-        res.send("Simulación de Terreno de LONG activada en el panel.");
-    });
-
-    bot.onText(/\/simulate_long_euphoria/, async (msg) => {
-        const chatId = msg.chat.id;
-        bot.sendMessage(chatId, "🧪 Simulando 'LONG en Euforia'...");
-        marketSummary.rocketAngle = -90;
-        marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
-        marketSummary.rocketColor = "rgb(74, 222, 128)";
-        marketSummary.fireIntensity = 1;
-        marketSummary.saturation = 1;
-        marketSummary.opacity = 1;
-        bot.sendMessage(chatId, "✅ Panel actualizado a Euforia LONG.");
-    });
-
-    bot.onText(/\/simulate_short_euphoria/, async (msg) => {
-        const chatId = msg.chat.id;
-        bot.sendMessage(chatId, "🧪 Simulando 'SHORT en Euforia'...");
-        marketSummary.rocketAngle = 90;
-        marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
-        marketSummary.rocketColor = "rgb(248, 113, 113)";
-        marketSummary.fireIntensity = 0;
-        marketSummary.saturation = 0.4;
-        marketSummary.opacity = 0.4;
-        bot.sendMessage(chatId, "✅ Panel actualizado a Euforia SHORT.");
-    });
-
-    app.get('/simulate-long-euphoria', (req, res) => {
-        marketSummary.rocketAngle = -90;
-        marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
-        marketSummary.fireIntensity = 1;
-        res.send("Panel en Euforia LONG.");
-    });
-
-    app.get('/simulate-short-euphoria', (req, res) => {
-        marketSummary.rocketAngle = 90;
-        marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
-        res.send("Panel en Euforia SHORT.");
+    // Comandos de simulación rápida de panel
+    bot.onText(/\/simulate_(long|short)_(terrain|euphoria)/i, async (msg, match) => {
+        const type = `${match[2].toUpperCase()}_${match[1].toUpperCase()}`;
+        await simulateSignalEffect('BTCUSDT', type, { updatePanel: true });
+        bot.sendMessage(msg.chat.id, `✅ Panel simulado como ${type}.`);
     });
 
     // CAPTURA GLOBAL: Guardar ID de CUALQUIER persona que escriba al bot
     bot.on('message', (msg) => {
-        if (msg.chat && msg.chat.id) {
-            saveUser(msg.chat.id);
+        if (!msg.chat || !msg.chat.id || msg.text?.startsWith('/')) return;
+        const chatId = msg.chat.id;
+
+        if (waitingForNickname.has(chatId)) {
+            const nickname = msg.text.trim().substring(0, 20); // Limitar largo
+            saveUser(chatId, nickname);
+            bot.sendMessage(chatId, `✅ ¡Perfecto! Te hemos guardado como **${nickname}**. Ya puedes recibir alertas y usar comandos como /reportALL.`);
+            waitingForNickname.delete(chatId);
+            return;
         }
+
+        const username = msg.from ? (msg.from.username || msg.from.first_name) : 'Usuario';
+        saveUser(chatId, username);
     });
 
     console.log('Bot escuchando comandos y capturando usuarios...');
 }
 
+// Admin: Enviar mensaje personalizado
+app.post('/admin/send-direct-message', async (req, res) => {
+    const { password, userId, message } = req.body;
+    if (password !== 'awd ') return res.status(403).json({ success: false });
+
+    try {
+        await bot.sendMessage(userId, `📩 **MENSAJE DEL ADMINISTRADOR:**\n\n${message}`);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
 // Endpoint ADMIN para actualizar señal
-app.use(express.json()); // Necesario para parsear body JSON
 
 app.post('/admin/update-signal', async (req, res) => {
     const { password, signalId, observationType } = req.body;
@@ -506,12 +518,8 @@ app.post('/admin/update-signal', async (req, res) => {
     // Recalculamos el estadoInfo original basado en tangente almacenada o texto almacenado
     // Para simplificar, usamos el texto guardado en history.
 
-    // Emojis mapping para observación
-    let obsEmoji = "";
-    if (observationType.includes("Señal dudosa")) obsEmoji = "🤔";
-    else if (observationType.includes("Señal FALSA")) obsEmoji = "❌";
-    else if (observationType.includes("Liquidaciones a favor")) obsEmoji = "💰";
-    else if (observationType.includes("Liquidaciones en contra")) obsEmoji = "💀";
+    const obsEmojis = { "Señal dudosa": "🤔", "Señal FALSA": "❌", "Liquidaciones a favor": "💰", "Liquidaciones en contra": "💀" };
+    const obsEmoji = obsEmojis[observationType] || "";
 
     // Reconstruir el mensaje base. NOTA: Esto debe coincidir con el formato original.
     // Como no guardamos el mensaje exacto, lo reconstruimos.
@@ -554,13 +562,63 @@ app.post('/admin/update-signal', async (req, res) => {
     res.json({ success: true, message: 'Observación actualizada y mensajes editados.' });
 });
 
+// Admin: Obtener lista de usuarios
+app.get('/admin/users', (req, res) => {
+    // En un entorno real, validar password aquí también si es necesario
+    const userList = Object.values(userDatabase);
+    res.json(userList);
+});
+
+// Admin: Actualizar preferencias de usuario
+app.post('/admin/update-user-prefs', (req, res) => {
+    const { password, userId, preferences } = req.body;
+    if (password !== 'awd ') return res.status(403).json({ success: false });
+
+    if (userDatabase[userId]) {
+        userDatabase[userId].preferences = preferences;
+        fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
+        return res.json({ success: true });
+    }
+    res.status(404).json({ success: false });
+});
+
+// Admin: Eliminar usuario
+app.post('/admin/delete-user', (req, res) => {
+    const { password, userId } = req.body;
+    if (password !== 'awd ') return res.status(403).json({ success: false });
+
+    if (userDatabase[userId]) {
+        delete userDatabase[userId];
+        fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
+        return res.json({ success: true });
+    }
+    res.status(404).json({ success: false });
+});
+
+// Admin: Simular alerta general para un usuario específico
+app.post('/admin/simulate-user-alert', async (req, res) => {
+    const { password, userId } = req.body;
+    if (password !== 'awd ') return res.status(403).json({ success: false });
+
+    const user = userDatabase[userId];
+    if (user) {
+        const msg = `🧪 SIMULACRO DE ALERTA GENERAL\n\nHola ${user.username}, esto es una prueba del sistema de alertas generales.`;
+        try {
+            await bot.sendMessage(userId, msg);
+            return res.json({ success: true });
+        } catch (e) {
+            return res.status(500).json({ success: false, message: e.message });
+        }
+    }
+    res.status(404).json({ success: false });
+});
+
 
 // --- 5. BUCLE PRINCIPAL ---
 async function procesarMercado() {
     console.log(`[${new Date().toLocaleTimeString()}] Escaneando...`);
 
     let totalWeight = 0;
-    let counts = {};
     let longTerrainCount = 0;
     let shortTerrainCount = 0;
 
@@ -586,7 +644,6 @@ async function procesarMercado() {
 
             // Resumen de mercado
             totalWeight += estadoInfo.weight || 0;
-            counts[estadoInfo.text] = (counts[estadoInfo.text] || 0) + 1;
             if (estadoInfo.terrain === 'LONG') longTerrainCount++;
             if (estadoInfo.terrain === 'SHORT') shortTerrainCount++;
 
@@ -600,24 +657,20 @@ async function procesarMercado() {
             const signal = evaluarAlertas(symbol, interval, indicadores, lastCandleTime);
 
             if (signal) {
-                // Si la señal es "En terreno de...", la ignoramos aquí (se manejará consolidada)
-                if (estadoInfo.text.includes("En terreno de")) {
-                    console.log(`Skipping individual terrain alert for ${symbol}`);
-                } else {
-                    const message = `🚀 ALERTA DITOX\n\n💎 ${symbol}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
-                    const sentMessages = await enviarTelegram(message);
+                const message = `🚀 ALERTA DITOX\n\n💎 ${symbol}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+                const sentMessages = await enviarTelegram(message, symbol);
 
-                    history.unshift({
-                        time: new Date().toISOString(),
-                        symbol, interval, signal,
-                        estadoText: estadoInfo.text,
-                        tangente: indicadores.tangente,
-                        sentMessages: sentMessages || [],
-                        observation: null,
-                        id: Date.now()
-                    });
-                    if (history.length > 20) history.pop();
-                }
+                history.unshift({
+                    time: new Date().toISOString(),
+                    symbol, interval, signal,
+                    estadoText: estadoInfo.text,
+                    estadoEmoji: estadoInfo.emoji,
+                    tangente: indicadores.tangente,
+                    sentMessages: sentMessages || [],
+                    observation: null,
+                    id: Date.now()
+                });
+                if (history.length > 20) history.pop();
             }
         }
     }
@@ -827,10 +880,10 @@ app.get('/', (req, res) => {
         .rocket-pivot { position: absolute; top: 50%; left: 0; width: 200px; height: 2px; transform-origin: left center; transition: transform 0.8s cubic-bezier(0.34, 1.56, 0.64, 1); animation: oscillate 3s infinite ease-in-out; }
         .rocket-wrapper { position: absolute; right: 0; top: 50%; transform: translateY(-50%) rotate(45deg); display: flex; align-items: center; justify-content: center; transition: filter 0.5s ease-out; }
         .rocket { font-size: 5rem; z-index: 2; user-select: none; }
-        .rocket-wrapper::after { content: "🔥"; position: absolute; font-size: 2rem; bottom: -18px; left: -18px; transform: rotate(135deg) scale(var(--fire-scale)); opacity: var(--fire-opacity); filter: blur(0.5px); animation: flicker 0.1s infinite alternate; z-index: 1; }
+        .rocket-wrapper::after { content: "🔥"; position: absolute; font-size: 2rem; bottom: -18px; left: -18px; transform: rotate(45deg) scale(var(--fire-scale)); opacity: var(--fire-opacity); filter: blur(0.5px); animation: flicker 0.1s infinite alternate; z-index: 1; }
         
         /* Animations */
-        @keyframes flicker { from { transform: rotate(135deg) scale(calc(var(--fire-scale) * 0.9)); } to { transform: rotate(135deg) scale(calc(var(--fire-scale) * 1.1)) translateY(2px); } }
+        @keyframes flicker { from { transform: rotate(45deg) scale(calc(var(--fire-scale) * 0.9)); } to { transform: rotate(45deg) scale(calc(var(--fire-scale) * 1.1)) translateY(2px); } }
         @keyframes oscillate { 0%, 100% { transform: translateY(-50%) translateY(0px) rotate(var(--rot-base)); } 50% { transform: translateY(-50%) translateY(5px) rotate(calc(var(--rot-base) + 2deg)); } }
         @keyframes breathing { 0%, 100% { opacity: 1; } 50% { opacity: 0.75; } }
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
@@ -952,6 +1005,31 @@ app.get('/', (req, res) => {
                 </table>
             </div>
         </div>
+
+        <!-- Gestión de Usuarios (Ditox Mode Only) -->
+        <div class="ditox-admin hidden mt-16 bg-gray-800/40 backdrop-blur-xl rounded-3xl border border-purple-500/30 overflow-hidden shadow-2xl">
+            <div class="p-6 border-b border-purple-500/30 flex justify-between items-center bg-purple-900/10">
+                <h2 class="text-xl font-bold text-purple-400 flex items-center gap-2">
+                    <span>👥</span> Gestión de Usuarios y Alertas Individuales
+                </h2>
+                <span class="text-xs text-purple-300/50 uppercase tracking-widest">Panel de Control Ditox</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-gray-900/50 text-gray-400 text-xs uppercase tracking-wider">
+                            <th class="py-4 px-6 font-semibold">ID</th>
+                            <th class="py-4 px-6 font-semibold">Usuario</th>
+                            <th class="py-4 px-6 font-semibold">Configuración de Alertas (Pares)</th>
+                            <th class="py-4 px-6 font-semibold">Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-table-body" class="text-sm divide-y divide-gray-700/50">
+                        <tr><td colspan="4" class="py-8 text-center text-gray-500">Cargando base de datos de usuarios...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
     <!-- Modals -->
@@ -1055,6 +1133,20 @@ app.get('/', (req, res) => {
         </div>
     </dialog>
 
+    <!-- Custom Prompt Modal -->
+    <dialog id="modal-prompt" class="bg-gray-900 text-white rounded-3xl p-0 w-full max-w-md shadow-2xl backdrop:bg-black/80 border border-purple-500/30">
+        <div class="p-8">
+            <h3 id="prompt-title" class="text-2xl font-bold mb-4 bg-gradient-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent"></h3>
+            <div class="mb-6">
+                <textarea id="prompt-input" class="w-full bg-gray-800/50 border border-gray-700 rounded-2xl p-4 text-sm focus:border-purple-500 focus:ring-1 focus:ring-purple-500 outline-none transition-all placeholder-gray-600" rows="3"></textarea>
+            </div>
+            <div class="flex justify-end gap-3">
+                <button onclick="closePrompt()" class="px-6 py-2 text-sm font-semibold text-gray-400 hover:text-white transition-colors">Cancelar</button>
+                <button onclick="handlePromptConfirm()" class="px-8 py-2 bg-gradient-to-r from-purple-600 to-blue-600 rounded-xl text-sm font-bold hover:shadow-[0_0_20px_rgba(168,85,247,0.4)] transition-all transform active:scale-95 text-white">Confirmar</button>
+            </div>
+        </div>
+    </dialog>
+
     <script>
         // Auto-refresh suave
         setTimeout(() => window.location.reload(), 30000); // 30s para no ser molesto
@@ -1067,8 +1159,55 @@ app.get('/', (req, res) => {
             document.getElementById('modal-review').showModal();
         }
 
+        // --- CUSTOM PROMPT LOGIC ---
+        let currentPromptResolver = null;
+
+        function showPrompt(title, placeholder = "", isPassword = false) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('modal-prompt');
+                document.getElementById('prompt-title').textContent = title;
+                const input = document.getElementById('prompt-input');
+                input.value = "";
+                input.placeholder = placeholder;
+                input.type = isPassword ? "password" : "text"; // Aunque sea textarea, type no funciona igual, pero para referencia.
+                
+                // Hack para password en textarea si fuera necesario, pero mejor textarea para mensajes largos.
+                // Si es password, usamos un estilo que oculte o un input separado?
+                // Vamos a usar un input type password si es para login.
+                
+                if (isPassword) {
+                    input.style.webkitTextSecurity = "disc";
+                } else {
+                    input.style.webkitTextSecurity = "none";
+                }
+
+                currentPromptResolver = resolve;
+                modal.showModal();
+                input.focus();
+            });
+        }
+
+        function handlePromptConfirm() {
+            const val = document.getElementById('prompt-input').value;
+            document.getElementById('modal-prompt').close();
+            if (currentPromptResolver) {
+                const res = currentPromptResolver;
+                currentPromptResolver = null;
+                res(val);
+            }
+        }
+
+        function closePrompt() {
+            document.getElementById('modal-prompt').close();
+            if (currentPromptResolver) {
+                const res = currentPromptResolver;
+                currentPromptResolver = null;
+                res(null);
+            }
+        }
+
         // --- DITOX ADMIN MODE ---
-        function toggleDitoxMode() {
+        async function toggleDitoxMode() {
             const current = localStorage.getItem('isDitox');
             if (current === 'true') {
                 // Logout
@@ -1076,11 +1215,11 @@ app.get('/', (req, res) => {
                 location.reload();
             } else {
                 // Login
-                const pwd = prompt("Contraseña de Admin:");
+                const pwd = await showPrompt("Acceso Administrador", "Introduce la contraseña...");
                 if (pwd === "awd ") { // "awd " con espacio
                     localStorage.setItem('isDitox', 'true');
                     location.reload();
-                } else {
+                } else if (pwd !== null) {
                     alert("Contraseña incorrecta");
                 }
             }
@@ -1100,8 +1239,116 @@ app.get('/', (req, res) => {
                     btn.textContent = "Salir Modo Ditox";
                     btn.classList.add("bg-red-900/20", "border-red-500/20");
                 }
+
+                // Cargar tabla de usuarios
+                loadAdminUserTable();
             }
         });
+
+        async function loadAdminUserTable() {
+            try {
+                const res = await fetch('/admin/users');
+                const users = await res.json();
+                const symbols = ${JSON.stringify(SYMBOLS)};
+                const container = document.getElementById('user-table-body');
+                
+                if (!users.length) {
+                    container.innerHTML = '<tr><td colspan="4" class="py-8 text-center text-gray-500 italic">No hay usuarios registrados aún.</td></tr>';
+                    return;
+                }
+
+                container.innerHTML = users.map(user => {
+                    const id = user.id;
+                    const prefCheckboxes = symbols.map(s => {
+                        const isChecked = user.preferences && user.preferences.includes(s);
+                        const sClean = s.replace('USDT', '');
+                        return \`
+                            <label class="inline-flex items-center bg-gray-900/50 px-2 py-1 rounded border border-gray-700 hover:border-blue-500/50 cursor-pointer transition-colors m-1">
+                                <input type="checkbox" class="mr-2 accent-blue-500" data-user="\${id}" data-symbol="\${s}" \${isChecked ? 'checked' : ''} onchange="updateUserPref('\${id}')">
+                                <span class="text-[10px] font-mono">\${sClean}</span>
+                            </label>
+                        \`;
+                   }).join('');
+
+                    return \`
+                        <tr class="hover:bg-purple-500/5 transition-colors">
+                            <td class="py-4 px-6 text-gray-500 font-mono text-xs">\${id}</td>
+                            <td class="py-4 px-6 font-bold text-gray-200">\${user.username || 'Usuario'}</td>
+                            <td class="py-4 px-6 flex flex-wrap max-w-xl">\${prefCheckboxes}</td>
+                            <td class="py-4 px-6">
+                                <div class="flex flex-col gap-2">
+                                    <button onclick="sendDirectMessage('\${id}')" class="bg-purple-600/20 text-purple-400 border border-purple-500/30 px-3 py-1 rounded text-xs hover:bg-purple-600/40 transition-all font-bold">Enviar Mensaje</button>
+                                    <button onclick="simulateUserAlert('\${id}')" class="bg-blue-600/20 text-blue-400 border border-blue-500/30 px-3 py-1 rounded text-xs hover:bg-blue-600/40 transition-all font-bold">Simular Gral</button>
+                                    <button onclick="deleteUser('\${id}')" class="bg-red-600/20 text-red-400 border border-red-500/30 px-3 py-1 rounded text-xs hover:bg-red-600/40 transition-all">Eliminar</button>
+                                </div>
+                            </td>
+                        </tr>
+                    \`;
+                }).join('');
+
+            } catch (e) {
+                console.error("Error loading user table", e);
+            }
+        }
+
+        async function updateUserPref(userId) {
+            const checkboxes = document.querySelectorAll(\`input[data-user="\${userId}"]\`);
+            const prefs = Array.from(checkboxes).filter(c => c.checked).map(c => c.getAttribute('data-symbol'));
+            
+            try {
+                await fetch('/admin/update-user-prefs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: 'awd ', userId, preferences: prefs })
+                });
+                console.log("Preferencias actualizadas para " + userId);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function deleteUser(userId) {
+            if (!confirm("¿Seguro que quieres eliminar a este usuario de la base de datos?")) return;
+            try {
+                const res = await fetch('/admin/delete-user', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: 'awd ', userId })
+                });
+                if ((await res.json()).success) {
+                    loadAdminUserTable();
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function simulateUserAlert(userId) {
+            try {
+                const res = await fetch('/admin/simulate-user-alert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: 'awd ', userId })
+                });
+                const data = await res.json();
+                if (data.success) alert("Simulación enviada!");
+                else alert("Error: " + data.message);
+            } catch (e) { console.error(e); }
+        }
+
+        async function sendDirectMessage(userId) {
+            const msg = await showPrompt("Enviar Mensaje Directo", "Escribe el mensaje para el usuario...");
+            if (!msg) return;
+
+            try {
+                const res = await fetch('/admin/send-direct-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: 'awd ', userId, message: msg })
+                });
+                const data = await res.json();
+                if (data.success) alert("Mensaje enviado exitosamente.");
+                else alert("Error: " + data.message);
+            } catch (e) { console.error(e); }
+        }
 
         async function updateSignal(id) {
             const select = document.getElementById('obs-select-' + id);
