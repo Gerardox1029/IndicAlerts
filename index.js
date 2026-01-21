@@ -329,11 +329,23 @@ if (bot) {
         bot.sendMessage(chatId, "👋 ¡Bienvenido a IndicAlerts Ditox!\n\nEstás suscrito a las alertas automáticas. También puedes usar comandos como /reportBTC o /reportSOL para ver el estado actual.\n\n Recuerda: Este bot no hace trading, solo resume la situación del mercado y envía alertas.");
     });
 
-    bot.onText(/\/report(.+)/, async (msg, match) => {
+    bot.onText(/\/reportALL/i, async (msg) => {
+        const chatId = msg.chat.id;
+        saveUser(chatId);
+        const threadId = msg.message_thread_id;
+        const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
+
+        const reportMsg = `📊 REPORTE GENERAL - ${dateStr}\n\nEstado Dominante: ${marketSummary.dominantState}\n${marketSummary.terrainNote !== "Indecisión (No operar) ⚖️" ? `Tendencia: ${marketSummary.terrainNote}` : ''}\n\nBy Ditox🔥`;
+
+        bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+    });
+
+    bot.onText(/\/report(?!\s*ALL\b)(.+)/i, async (msg, match) => {
         const chatId = msg.chat.id;
         saveUser(chatId); // Suscribir automáticamente a quien pida reportes
         const threadId = msg.message_thread_id; // Thread desde donde se pide
         const rawSymbol = match[1].trim().toUpperCase();
+        if (rawSymbol === 'ALL') return; // Salvaguarda extra
 
         // Mapeo básico o intento directo
         // Si escribe /reportBTC -> BTC, luego buscamos BTCUSDT
@@ -379,16 +391,6 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
         }
     });
 
-    bot.onText(/\/reportALL/, async (msg) => {
-        const chatId = msg.chat.id;
-        saveUser(chatId);
-        const threadId = msg.message_thread_id;
-        const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
-
-        const reportMsg = `📊 REPORTE GENERAL - ${dateStr}\n\nEstado Dominante: ${marketSummary.dominantState}\n${marketSummary.terrainNote !== "Indecisión (No operar)" ? `Tendencia: ${marketSummary.terrainNote} 🚀` : ''}\n\n¡Sigue operando con responsabilidad! 🔥`;
-
-        bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
-    });
 
     bot.onText(/\/simulate_triple_terrain/, async (msg) => {
         const chatId = msg.chat.id;
@@ -631,10 +633,10 @@ async function procesarMercado() {
         const red = Math.floor(255 * (1 - greenRatio));
         const green = Math.floor(255 * greenRatio);
         marketSummary.rocketColor = `rgb(${red}, ${green}, 0)`;
-        marketSummary.terrainNote = longTerrainCount >= shortTerrainCount ? "En terreno de LONG" : "En terreno de SHORT";
+        marketSummary.terrainNote = longTerrainCount >= shortTerrainCount ? "En terreno de LONG 🚀" : "En terreno de SHORT 🔻";
     } else {
         marketSummary.rocketColor = 'rgb(156, 163, 175)'; // Gray
-        marketSummary.terrainNote = "Indecisión (No operar)";
+        marketSummary.terrainNote = "Indecisión (No operar) ⚖️";
     }
 
     // --- Lógica Avanzada del Cohete (Reversada según usuario) ---
@@ -658,14 +660,14 @@ async function procesarMercado() {
     }
 
     // --- Mapeo de Estado Dominante (Mega Título) y Color Dinámico ---
-    if (marketSummary.terrainNote && marketSummary.terrainNote !== "Indecisión (No operar)") {
+    if (marketSummary.terrainNote && marketSummary.terrainNote !== "Indecisión (No operar) ⚖️") {
         marketSummary.dominantState = marketSummary.terrainNote;
     } else {
-        if (val >= 45) marketSummary.dominantState = "SHORT en Euforia, no buscar LONG";
-        else if (val > 15) marketSummary.dominantState = "Short en curso...";
-        else if (val <= -45) marketSummary.dominantState = "LONG en Euforia, no buscar SHORT";
-        else if (val < -15) marketSummary.dominantState = "Long en curso...";
-        else marketSummary.dominantState = "Indecisión";
+        if (val >= 45) marketSummary.dominantState = "SHORT en Euforia 🔻💀";
+        else if (val > 15) marketSummary.dominantState = "Short en curso... 📉";
+        else if (val <= -45) marketSummary.dominantState = "LONG en Euforia 🚀🔥";
+        else if (val < -15) marketSummary.dominantState = "Long en curso... 📈";
+        else marketSummary.dominantState = "Indecisión ⚖️";
     }
 
     // Calcular Color Dinámico (Interpolación RGB)
