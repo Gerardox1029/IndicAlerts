@@ -18,11 +18,22 @@
   "6967546776": {
     "id": "6967546776",
     "username": "Hincha Peru",
-    "preferences": []
+    "preferences": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "DOGEUSDT",
+      "SUIUSDT"
+    ]
   },
   "-1003055730763": {
     "id": "-1003055730763",
     "username": "ditox_18",
-    "preferences": []
+    "preferences": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT"
+    ]
   }
 }

@@ -230,15 +230,31 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
 
     const key = `${symbol}_${interval}`;
     const estadoPrevio = estadoAlertas[key] || {};
+    const now = Date.now();
+    const TWO_HOURS = 2 * 60 * 60 * 1000;
 
     // Evitar repetición en la misma vela
     if (estadoPrevio.lastAlertSignal === signal && estadoPrevio.lastCandleTime === lastCandleTime) {
         return null;
     }
 
+    // Cooldown de 2h para la MISMA señal
+    if (estadoPrevio.lastAlertSignal === signal && estadoPrevio.lastAlertTime) {
+        if (now - estadoPrevio.lastAlertTime < TWO_HOURS) {
+            // Actualizamos la vela vista para no procesarla de nuevo, pero no enviamos alerta (return null)
+            estadoAlertas[key] = {
+                ...estadoPrevio,
+                lastCandleTime: lastCandleTime
+            };
+            // console.log(`⏳ Cooldown para ${symbol} ${signal} (${((TWO_HOURS - (now - estadoPrevio.lastAlertTime))/60000).toFixed(0)}m restantes)`);
+            return null;
+        }
+    }
+
     estadoAlertas[key] = {
         lastAlertSignal: signal,
-        lastCandleTime: lastCandleTime
+        lastCandleTime: lastCandleTime,
+        lastAlertTime: now
     };
 
     return signal;
@@ -247,9 +263,48 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
 
 // --- 4. TELEGRAM BOT LOGIC ---
 
+const STICKERS_FILE = path.join(__dirname, 'stickers.json');
+let stickyDatabase = [];
+
+// Cargar stickers
+function loadStickers() {
+    if (fs.existsSync(STICKERS_FILE)) {
+        try {
+            stickyDatabase = JSON.parse(fs.readFileSync(STICKERS_FILE, 'utf8'));
+            console.log(`🎨 Stickers cargados: ${stickyDatabase.length}`);
+        } catch (e) {
+            console.error('Error cargando stickers.json:', e);
+        }
+    }
+}
+loadStickers();
+
+function saveSticker(fileId) {
+    if (!stickyDatabase.includes(fileId)) {
+        stickyDatabase.push(fileId);
+        fs.writeFileSync(STICKERS_FILE, JSON.stringify(stickyDatabase, null, 2));
+        console.log(`🎨 Nuevo sticker guardado: ${fileId}`);
+        return true;
+    }
+    return false;
+}
+
+function getPeruTime() {
+    return new Date().toLocaleString('es-PE', {
+        timeZone: 'America/Lima',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true
+    }).toUpperCase();
+}
+
 // Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
-async function enviarTelegram(message, symbol = null) {
+async function enviarTelegram(messageText, symbol = null, options = {}) {
     if (!bot) return;
+
+    // Agregar Hora Perú al mensaje
+    const timeStr = `🕒 ${getPeruTime()} (PE)`;
+    const fullMessage = `${messageText}\n\n${timeStr}`;
 
     // 1. Obtener IDs del .env (TELEGRAM_CHAT_ID puede ser una lista separada por comas)
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
@@ -265,25 +320,38 @@ async function enviarTelegram(message, symbol = null) {
         }
     }
 
-    // 3. Combinar con IDs de ENV y el grupo objetivo (estos siempre reciben TODO)
-    const allRecipients = new Set([...envIds, ...filteredSubscribers, TARGET_GROUP_ID]);
+    // 3. Combinar con IDs de ENV (el grupo objetivo ahora depende de sus preferencias en userDatabase)
+    const allRecipients = new Set([...envIds, ...filteredSubscribers]);
 
     console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios (Símbolo: ${symbol || 'GENERAL'})`);
 
     const sentMessages = [];
+    const msgOptions = options.message_thread_id ? { message_thread_id: options.message_thread_id } : {};
+
+    // Elegir sticker al azar
+    let randomSticker = null;
+    if (stickyDatabase.length > 0 && !options.skipSticker) {
+        randomSticker = stickyDatabase[Math.floor(Math.random() * stickyDatabase.length)];
+    }
 
     for (const chatId of allRecipients) {
         try {
-            const options = {};
+            const sendOptions = {};
             if (String(chatId).trim() === String(TARGET_GROUP_ID).trim() && THREAD_ID) {
-                options.message_thread_id = parseInt(THREAD_ID);
+                sendOptions.message_thread_id = parseInt(THREAD_ID);
             }
 
-            const sentMsg = await bot.sendMessage(chatId, message, options);
+            // Enviar Texto
+            const sentMsg = await bot.sendMessage(chatId, fullMessage, sendOptions);
             sentMessages.push({
                 chatId: chatId,
                 messageId: sentMsg.message_id
             });
+
+            // Enviar Sticker (si existe)
+            if (randomSticker) {
+                await bot.sendSticker(chatId, randomSticker, sendOptions).catch(e => console.error(`Error enviando sticker a ${chatId}:`, e.message));
+            }
 
         } catch (error) {
             console.error(`❌ ERROR enviando a ${chatId}:`, error.message);
@@ -310,7 +378,7 @@ async function simulateSignalEffect(symbol, type, options = {}) {
         tangente = tUpper.includes('EUPHORIA') ? -1.5 : -0.05;
         curveTrend = 'UP';
         text = tUpper.includes('EUPHORIA') ? "SHORT en euforia, no buscar LONG" : "En terreno de SHORT";
-        emoji = tUpper.includes('EUPHORIA') ? "🩸" : "�";
+        emoji = tUpper.includes('EUPHORIA') ? "🩸" : "🔴";
     }
 
     if (options.trackTerrain) trackTerrain(tUpper.includes('LONG') ? 'LONG' : 'SHORT', sUpper);
@@ -374,9 +442,15 @@ if (bot) {
         const threadId = msg.message_thread_id;
         const dateStr = new Date().toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' });
 
-        const reportMsg = `📊 REPORTE GENERAL - ${dateStr}\n\nEstado Dominante: ${marketSummary.dominantState}\n${marketSummary.terrainNote !== "Indecisión (No operar) ⚖️" ? `Tendencia: ${marketSummary.terrainNote}` : ''}\n\nBy Ditox🔥`;
+        const reportMsg = `📊 REPORTE GENERAL - ${dateStr}\n\nEstado Dominante: ${marketSummary.dominantState}\n${marketSummary.terrainNote !== "Indecisión (No operar) ⚖️" ? `Tendencia: ${marketSummary.terrainNote}` : ''}\n\nBy Ditox🔥\n\n🕒 ${getPeruTime()} (PE)`;
 
-        bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+        await bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+
+        // Enviar sticker si hay
+        if (stickyDatabase.length > 0) {
+            const randomSticker = stickyDatabase[Math.floor(Math.random() * stickyDatabase.length)];
+            bot.sendSticker(chatId, randomSticker, { message_thread_id: threadId }).catch(console.error);
+        }
     });
 
     bot.onText(/\/report(?!\s*ALL\b)(.+)/i, async (msg, match) => {
@@ -419,10 +493,17 @@ if (bot) {
                 const reportMsg = `✍️ REPORTE MANUAL
 💎 ${symbol} (${interval})
 Precio: $${indicadores.currentPrice}
-Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+Estado: ${estadoInfo.text} ${estadoInfo.emoji}
+
+🕒 ${getPeruTime()} (PE)`;
 
                 // Responder en el MISMO hilo
-                bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+                await bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
+                // Enviar sticker si hay
+                if (stickyDatabase.length > 0) {
+                    const randomSticker = stickyDatabase[Math.floor(Math.random() * stickyDatabase.length)];
+                    bot.sendSticker(chatId, randomSticker, { message_thread_id: threadId }).catch(console.error);
+                }
             } else {
                 bot.sendMessage(chatId, `❌ Error calculando indicadores para ${symbol}`, { message_thread_id: threadId });
             }
@@ -464,8 +545,19 @@ Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
 
     // CAPTURA GLOBAL: Guardar ID de CUALQUIER persona que escriba al bot
     bot.on('message', (msg) => {
-        if (!msg.chat || !msg.chat.id || msg.text?.startsWith('/')) return;
+        if (!msg.chat || !msg.chat.id) return;
         const chatId = msg.chat.id;
+
+        // Lógica de captura de Stickers (Solo Admin)
+        if (msg.sticker && String(chatId) === '1985505500') {
+            const fileId = msg.sticker.file_id;
+            if (saveSticker(fileId)) {
+                bot.sendMessage(chatId, `✅ Sticker guardado en la base de datos.`);
+            }
+            return;
+        }
+
+        if (msg.text && msg.text.startsWith('/')) return;
 
         if (waitingForNickname.has(chatId)) {
             const nickname = msg.text.trim().substring(0, 20); // Limitar largo
