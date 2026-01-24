@@ -8,18 +8,19 @@
     "id": "1985505500",
     "username": "ditox_18",
     "preferences": [
+      "BTCUSDT",
       "SOLUSDT",
       "DOGEUSDT",
       "ADAUSDT",
       "RENDERUSDT",
-      "WLDUSDT"
+      "WLDUSDT",
+      "SUIUSDT"
     ]
   },
   "6967546776": {
     "id": "6967546776",
     "username": "Hincha Peru",
     "preferences": [
-      "BTCUSDT",
       "ETHUSDT",
       "SOLUSDT",
       "BNBUSDT",
@@ -31,7 +32,6 @@
     "id": "-1003055730763",
     "username": "ditox_18",
     "preferences": [
-      "BTCUSDT",
       "ETHUSDT",
       "SOLUSDT"
     ]

@@ -6,41 +6,88 @@ const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
+const mongoose = require('mongoose');
+
+// --- CONFIGURACIÓN MONGODB ---
+const MONGODB_URI = process.env.MONGODB_URI;
+
+const UserSchema = new mongoose.Schema({
+    id: { type: String, required: true, unique: true },
+    username: String,
+    preferences: [String],
+    joinedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+
+// Conexión a Base de Datos
+if (MONGODB_URI) {
+    mongoose.connect(MONGODB_URI)
+        .then(() => console.log('✅ Conectado a MongoDB'))
+        .catch(err => console.error('❌ Error conectando a MongoDB:', err));
+} else {
+    console.warn('⚠️ MONGODB_URI no definido. Se usará almacenamiento en memoria/archivo (si existe).');
+}
 
 const USERS_FILE = path.join(__dirname, 'users.json');
-let userDatabase = {}; // { chatId: { id, username, preferences: [] } }
+const DATA_PATH_FILE = process.env.DATA_PATH ? path.join(process.env.DATA_PATH, 'users.json') : USERS_FILE;
 
-// Cargar usuarios al inicio
-function loadUsers() {
-    if (fs.existsSync(USERS_FILE)) {
+let userDatabase = {}; // Cache en memoria para acceso rápido
+
+// Cargar usuarios (MongoDB -> Memoria)
+async function loadUsers() {
+    // 1. Intentar cargar de MongoDB si hay conexión
+    if (mongoose.connection.readyState === 1) {
         try {
-            const data = fs.readFileSync(USERS_FILE, 'utf8');
+            const users = await User.find({});
+            users.forEach(u => {
+                userDatabase[u.id] = {
+                    id: u.id,
+                    username: u.username,
+                    preferences: u.preferences
+                };
+            });
+            console.log(`👥 Usuarios cargados desde MongoDB: ${Object.keys(userDatabase).length}`);
+            return;
+        } catch (e) {
+            console.error('Error cargando de MongoDB:', e);
+        }
+    }
+
+    // 2. Fallback: Cargar de archivo local (Migración o sin DB)
+    const fileToRead = fs.existsSync(DATA_PATH_FILE) ? DATA_PATH_FILE : (fs.existsSync(USERS_FILE) ? USERS_FILE : null);
+
+    if (fileToRead) {
+        try {
+            const data = fs.readFileSync(fileToRead, 'utf8');
             const users = JSON.parse(data);
 
             if (Array.isArray(users)) {
-                // Migración de formato viejo (Array de IDs) a nuevo formato (Objeto)
                 users.forEach(id => {
                     const idStr = String(id);
-                    userDatabase[idStr] = {
-                        id: idStr,
-                        username: 'Usuario',
-                        preferences: [] // Por defecto solo alertas generales
-                    };
+                    userDatabase[idStr] = { id: idStr, username: 'Usuario', preferences: [] };
                 });
-                // Guardar migración
-                fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
-                console.log(`♻️ Migrados ${Object.keys(userDatabase).length} usuarios al nuevo formato.`);
             } else if (typeof users === 'object') {
                 userDatabase = users;
-                console.log(`👥 Usuarios cargados: ${Object.keys(userDatabase).length}`);
+            }
+            console.log(`📂 Usuarios cargados desde Archivo Local: ${Object.keys(userDatabase).length}`);
+
+            // Migrar a Mongo si es posible
+            if (MONGODB_URI) {
+                console.log('🔄 Iniciando migración de archivo a MongoDB...');
+                for (const id in userDatabase) {
+                    await saveUserToMongo(userDatabase[id]);
+                }
+                console.log('✅ Migración completada.');
             }
         } catch (e) {
-            console.error('Error cargando users.json:', e);
+            console.error('Error cargando archivo users:', e);
         }
     }
 }
 
-function saveUser(chatId, username = 'Usuario') {
+// Guardar usuario (Memoria + MongoDB Async)
+async function saveUser(chatId, username = 'Usuario') {
     const idStr = String(chatId);
     let changed = false;
 
@@ -57,32 +104,63 @@ function saveUser(chatId, username = 'Usuario') {
     }
 
     if (changed) {
+        // Guardar en Mongo
+        if (mongoose.connection.readyState === 1 || MONGODB_URI) {
+            saveUserToMongo(userDatabase[idStr]);
+        }
+
+        // Guardar en archivo (backup persistencia local)
         try {
-            fs.writeFileSync(USERS_FILE, JSON.stringify(userDatabase, null, 2));
-            console.log(`✅ Usuario actualizado/guardado: ${idStr} (${username})`);
+            // Solo si se usa Volume Mount o local dev
+            saveUserToFile();
         } catch (e) {
-            console.error('Error guardando users.json:', e);
+            // Ignorar error de archivo si estamos full mongo
         }
     }
 }
 
+async function saveUserToMongo(userData) {
+    try {
+        await User.findOneAndUpdate(
+            { id: userData.id },
+            userData,
+            { upsert: true, new: true }
+        );
+        console.log(`💾 Usuario guardado en DB: ${userData.id}`);
+    } catch (e) {
+        console.error('Error guardando en Mongo:', e.message);
+    }
+}
+
+function saveUserToFile() {
+    // Implementación simple para mantener compatibilidad con Volume Mounts si se desea
+    try {
+        // Usar DATA_PATH si existe
+        const targetFile = process.env.DATA_PATH ? path.join(process.env.DATA_PATH, 'users.json') : USERS_FILE;
+        fs.writeFileSync(targetFile, JSON.stringify(userDatabase, null, 2));
+    } catch (e) {
+        console.error('Error escribiendo archivo local:', e.message);
+    }
+}
+
+// Iniciar carga (Promesa no bloqueante para el flujo principal, pero buena practica esperar si fuera critico)
 loadUsers();
 
 // --- 1. CONFIGURACIÓN DINÁMICA ---
 const SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', // Large Caps
-    'DOGEUSDT', 'AVAXUSDT', 'ADAUSDT', 'TRXUSDT', // Mid Caps
+    'DOGEUSDT', 'AVAXUSDT', 'ADAUSDT', // Mid Caps
     'RENDERUSDT', 'NEARUSDT', 'WLDUSDT', 'SUIUSDT' // Small Caps
 ];
 
 const CATEGORIES = {
     'Large Caps': ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'],
-    'Mid Caps': ['DOGEUSDT', 'AVAXUSDT', 'ADAUSDT', 'TRXUSDT'],
+    'Mid Caps': ['DOGEUSDT', 'AVAXUSDT', 'ADAUSDT'],
     'Small Caps': ['RENDERUSDT', 'NEARUSDT', 'WLDUSDT', 'SUIUSDT']
 };
 
 const INTERVALS = ['2h'];
-const CHECK_INTERVAL_MS = 60000;
+const CHECK_INTERVAL_MS = 60000; // 1 minuto
 const REQUEST_DELAY_MS = 250;
 
 const app = express();
@@ -123,14 +201,30 @@ let marketSummary = {
     fireIntensity: 0
 };
 
+// --- 1.1 HELPERS DE PRECISIÓN ---
+function getDecimals(value) {
+    if (!value && value !== 0) return 0;
+    const s = String(value);
+    const dot = s.indexOf('.');
+    return dot === -1 ? 0 : s.length - dot - 1;
+}
+
+function formatPrice(value, referenceValue) {
+    if (!value && value !== 0) return '0';
+    const decimals = getDecimals(referenceValue);
+    return parseFloat(value).toFixed(decimals);
+}
+
 // --- 2. LÓGICA DE DATOS (Binance API) ---
 async function fetchData(symbol, interval, limit = 100) {
     try {
         const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         const response = await axios.get(url);
         const closes = response.data.map(k => parseFloat(k[4]));
+        const highs = response.data.map(k => parseFloat(k[2]));
+        const lows = response.data.map(k => parseFloat(k[3]));
         const closeTimes = response.data.map(k => k[6]);
-        return { closes, closeTimes };
+        return { closes, highs, lows, closeTimes };
     } catch (error) {
         console.error(`Error fetching data for ${symbol} ${interval}:`, error.message);
         return null;
@@ -138,7 +232,7 @@ async function fetchData(symbol, interval, limit = 100) {
 }
 
 // --- 3. MOTOR MATEMÁTICO ---
-function calcularIndicadores(closes) {
+function calcularIndicadores(closes, highs, lows) {
     if (!closes || closes.length < 50) return null;
 
     // RSI de 20 períodos
@@ -179,8 +273,83 @@ function calcularIndicadores(closes) {
         rsiSuavizado: currentRsiSuavizado,
         tangente: tangente,
         curveTrend: curveTrend,
-        currentPrice: closes[closes.length - 1]
+        currentPrice: closes[closes.length - 1],
+        highs, // Pasar para referencia de decimales
+        lows
     };
+}
+
+// Nueva función para calcular precio de entrada "Posible entrada"
+function calculateEntryPrice(signal, highs, lows) {
+    // Necesitamos las últimas 8 velas ANTERIORES a la actual.
+    // data.highs y data.lows incluyen la vela actual en la última posición si limit=100.
+    // Asumimos que la vela actual es la última (index length-1).
+    // Queremos indices desde length-9 hasta length-2.
+
+    if (highs.length < 10) return null;
+
+    const startIdx = highs.length - 9;
+    const endIdx = highs.length - 1; // Slice no incluye el end, así que hasta -1 toma hasta el penúltimo.
+
+    const rangeHighs = highs.slice(startIdx, endIdx);
+    const rangeLows = lows.slice(startIdx, endIdx);
+
+    // Obtener 2 mas altos y 2 mas bajos
+    const sortedHighs = [...rangeHighs].sort((a, b) => b - a); // Desc
+    const top2Highs = sortedHighs.slice(0, 2);
+
+    const sortedLows = [...rangeLows].sort((a, b) => a - b); // Asc
+    const bottom2Lows = sortedLows.slice(0, 2);
+
+    const avgHigh = (top2Highs[0] + top2Highs[1]) / 2;
+    const avgLow = (bottom2Lows[0] + bottom2Lows[1]) / 2;
+
+    // Fibonacci Retracement
+    // LONG:  Low (1) -> High (0). Ext 1.618 es "debajo" del low? 
+    // Requerimiento: "Desde valor más bajo (nivel 1) hasta valor más alto (nivel 0), obteniendo entrada en 1.618"
+    // Formula Fib: P = P1 + (P2 - P1) * Level
+    // Nivel 0 = High (P2), Nivel 1 = Low (P1). 
+    // 0 = P1 + diff * 0 -> P1 debe ser High? No.
+    // Generalmente Retracement se dibuja del Swing Low al Swing High para encontrar soportes (pullbacks).
+    // Si nivel 0 es High y Nivel 1 es Low:
+    // Rango = High - Low.
+    // Nivel X = High - (Rango * X) ??? 
+    // Si la user dice: "Desde valor más bajo (nivel 1) hasta valor más alto (nivel 0)".
+    // Significa que en 0 está el High y en 1 está el Low.
+    // 1.618 estaría MÁS ABAJO del Low. (Proyección bajista o Retra profundo).
+    // Vamos a usar la fórmula vectorial simple:
+    // StartPoint (Level 1) -> EndPoint (Level 0).
+    // Vector = End - Start.
+    // Point(Level) = Start + Vector * (1 - Level) ?? Ojo con como se definen niveles en TradingView.
+    // Si trazas Fib desde A(1) a B(0).
+    // 0.5 está al medio.
+    // 1.618 está "pasando" A alejandose de B? NO.
+    // En tradingview Fib Retracement tool: Click 1 (1.00), Click 2 (0.00).
+    // 1.618 es una extensión mas allá de 1.
+    // Si A=Low(1), B=High(0). 1.618 seria mas abajo de Low.
+    // Calculo: Diff = High - Low.
+    // Entry = High - (Diff * 1.618).
+
+    // Si es SHORT: "Desde valor más alto (nivel 1) hasta más bajo (nivel 0)".
+    // A=High(1), B=Low(0).
+    // Entry = Low + (Diff * 1.618). (Mas arriba del High).
+
+    let entryPrice = 0;
+    const diff = avgHigh - avgLow;
+
+    if (signal === 'LONG' || signal.includes('LONG')) {
+        // En Terreno de LONG -> Buscamos entrada ABAJO.
+        // Nivel 1 = Low, Nivel 0 = High.
+        // Entry = High - (diff * 1.618);
+        entryPrice = avgHigh - (diff * 1.618);
+    } else {
+        // En Terreno de SHORT -> Buscamos entrada ARRIBA.
+        // Nivel 1 = High, Nivel 0 = Low.
+        // Entry = Low + (diff * 1.618);
+        entryPrice = avgLow + (diff * 1.618);
+    }
+
+    return entryPrice > 0 ? formatPrice(entryPrice, highs[0]) : null;
 }
 
 // Helper para determinar Estado y Emojis
@@ -217,7 +386,7 @@ function trackTerrain(type, symbol) {
     }
 }
 
-function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
+function evaluarAlertas(symbol, interval, indicadores, lastCandleTime, highs, lows) {
     const { tangente, curveTrend } = indicadores;
     let signal = null;
 
@@ -233,6 +402,15 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
     const now = Date.now();
     const TWO_HOURS = 2 * 60 * 60 * 1000;
 
+    // Calcular Entrada siempre que haya señal, para mostrarla
+    const entryPrice = calculateEntryPrice(signal, highs, lows);
+    if (entryPrice) {
+        // Guardamos entrada en estado alertas para mostrar en cards
+        if (!estadoAlertas[key]) estadoAlertas[key] = {};
+        estadoAlertas[key].lastEntryType = signal;
+        estadoAlertas[key].lastEntryPrice = entryPrice;
+    }
+
     // Evitar repetición en la misma vela
     if (estadoPrevio.lastAlertSignal === signal && estadoPrevio.lastCandleTime === lastCandleTime) {
         return null;
@@ -241,12 +419,12 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
     // Cooldown de 2h para la MISMA señal
     if (estadoPrevio.lastAlertSignal === signal && estadoPrevio.lastAlertTime) {
         if (now - estadoPrevio.lastAlertTime < TWO_HOURS) {
-            // Actualizamos la vela vista para no procesarla de nuevo, pero no enviamos alerta (return null)
             estadoAlertas[key] = {
                 ...estadoPrevio,
-                lastCandleTime: lastCandleTime
+                lastCandleTime: lastCandleTime,
+                lastEntryType: signal,
+                lastEntryPrice: entryPrice
             };
-            // console.log(`⏳ Cooldown para ${symbol} ${signal} (${((TWO_HOURS - (now - estadoPrevio.lastAlertTime))/60000).toFixed(0)}m restantes)`);
             return null;
         }
     }
@@ -254,11 +432,14 @@ function evaluarAlertas(symbol, interval, indicadores, lastCandleTime) {
     estadoAlertas[key] = {
         lastAlertSignal: signal,
         lastCandleTime: lastCandleTime,
-        lastAlertTime: now
+        lastAlertTime: now,
+        lastEntryType: signal,
+        lastEntryPrice: entryPrice
     };
 
-    return signal;
+    return { signal, entryPrice };
 }
+
 
 
 // --- 4. TELEGRAM BOT LOGIC ---
@@ -299,6 +480,7 @@ function getPeruTime() {
 }
 
 // Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
+// Enviar Mensaje (Broadcast + Thread ID específico + Usuarios Suscritos)
 async function enviarTelegram(messageText, symbol = null, options = {}) {
     if (!bot) return;
 
@@ -310,20 +492,35 @@ async function enviarTelegram(messageText, symbol = null, options = {}) {
     const rawChatIds = process.env.TELEGRAM_CHAT_ID || '';
     const envIds = rawChatIds.split(',').map(id => id.trim()).filter(id => id);
 
-    // 2. Filtrar usuarios según preferencias si hay un símbolo específico
-    const filteredSubscribers = [];
+    // 2. Construir lista final de destinatarios
+    let finalRecipients = new Set();
+
+    // 2a. Usuarios en Database: Verificar preferencias estrictamente
     for (const chatId in userDatabase) {
         const user = userDatabase[chatId];
-        // Si no hay símbolo (alerta general), o el usuario tiene el símbolo en sus preferencias
+        // Si hay símbolo (alerta individual), debe tenerlo en preferencias.
+        // Si es reporte general (symbol null), todos reciben.
         if (!symbol || (user.preferences && user.preferences.includes(symbol))) {
-            filteredSubscribers.push(chatId);
+            finalRecipients.add(chatId);
         }
     }
 
-    // 3. Combinar con IDs de ENV (el grupo objetivo ahora depende de sus preferencias en userDatabase)
-    const allRecipients = new Set([...envIds, ...filteredSubscribers]);
+    // 2b. Usuarios en ENV (.env):
+    // El requerimiento dice: "desobedecen a las alertas individuales... no se seleccionó su casilla 'BNB'... y aún así recibe alertas".
+    // Esto implica que si el ID del .env TAMBIÉN está en userDatabase, debe respetar las reglas de userDatabase.
+    // Solo si NO está en userDatabase, asumimos que quiere todo (comportamiento legacy/fallback).
 
-    console.log(`📢 Enviando difusión a ${allRecipients.size} destinatarios (Símbolo: ${symbol || 'GENERAL'})`);
+    envIds.forEach(id => {
+        if (userDatabase[id]) {
+            // Ya fue procesado arriba. Si no entró, es porque no tenía el símbolo.
+            // No lo forzamos.
+        } else {
+            // No está en la base de datos, lo agregamos como fallback (recibe todo).
+            finalRecipients.add(id);
+        }
+    });
+
+    console.log(`📢 Enviando difusión a ${finalRecipients.size} destinatarios (Símbolo: ${symbol || 'GENERAL'})`);
 
     const sentMessages = [];
     const msgOptions = options.message_thread_id ? { message_thread_id: options.message_thread_id } : {};
@@ -334,7 +531,7 @@ async function enviarTelegram(messageText, symbol = null, options = {}) {
         randomSticker = stickyDatabase[Math.floor(Math.random() * stickyDatabase.length)];
     }
 
-    for (const chatId of allRecipients) {
+    for (const chatId of finalRecipients) {
         try {
             const sendOptions = {};
             if (String(chatId).trim() === String(TARGET_GROUP_ID).trim() && THREAD_ID) {
@@ -369,16 +566,25 @@ async function simulateSignalEffect(symbol, type, options = {}) {
     const interval = '2h';
     let text = "Desconocido", emoji = "❓", tangente = 0, curveTrend = 'NEUTRAL';
 
+    // Mock Entry Price (Simulado)
+    // Precio base aleatorio (ej. 100) o ficticio. 
+    // Como no tenemos precio real, inventamos uno o usamos uno "quemado" si no hay data.
+    // Mejor: intentamos obtener precio actual si existe en cache, si no 1000.
+    const lastPrice = estadoAlertas[`${sUpper}_2h`]?.currentPrice || 100;
+    let mockEntryPrice = 0;
+
     if (tUpper.includes('LONG')) {
         tangente = tUpper.includes('EUPHORIA') ? 1.5 : 0.05;
         curveTrend = 'DOWN';
         text = tUpper.includes('EUPHORIA') ? "LONG en euforia, no buscar SHORT" : "En terreno de LONG";
         emoji = tUpper.includes('EUPHORIA') ? "🚀" : "🍏";
+        mockEntryPrice = lastPrice * 0.98; // 2% abajo
     } else if (tUpper.includes('SHORT')) {
         tangente = tUpper.includes('EUPHORIA') ? -1.5 : -0.05;
         curveTrend = 'UP';
         text = tUpper.includes('EUPHORIA') ? "SHORT en euforia, no buscar LONG" : "En terreno de SHORT";
         emoji = tUpper.includes('EUPHORIA') ? "🩸" : "🔴";
+        mockEntryPrice = lastPrice * 1.02; // 2% arriba
     }
 
     if (options.trackTerrain) trackTerrain(tUpper.includes('LONG') ? 'LONG' : 'SHORT', sUpper);
@@ -390,9 +596,23 @@ async function simulateSignalEffect(symbol, type, options = {}) {
         marketSummary.fireIntensity = tUpper.includes('LONG') ? (tUpper.includes('EUPHORIA') ? 1 : 0.8) : 0;
         marketSummary.opacity = tUpper.includes('LONG') ? 1 : 0.6;
         marketSummary.saturation = tUpper.includes('LONG') ? 1 : 0.4;
+
+        // REVERTIR EFECTO DESPUÉS DE 1 MINUTO
+        console.log(`⏱ Simulacro activo. Se revertirá a estado real en 1 minuto...`);
+        setTimeout(() => {
+            console.log(`🔄 Revertiendo simulacro, escaneando mercado real...`);
+            procesarMercado();
+        }, 60000);
     }
 
-    const message = `🚀 ALERTA DITOX (SIMULACRO)\n\n💎 ${sUpper}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${text} ${emoji}`;
+    let message = `🚀 ALERTA DITOX (SIMULACRO)\n\n💎 ${sUpper}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${text} ${emoji}`;
+
+    // Agregar Entry Price al simulacro si es terreno o long/short
+    if (mockEntryPrice && (text.includes('En terreno de') || tUpper.includes('LONG') || tUpper.includes('SHORT'))) {
+        const typeStr = tUpper.includes('LONG') ? 'LONG' : 'SHORT';
+        message += `\n\n🎯 Posible Entrada ${typeStr} (al tick): $${mockEntryPrice.toFixed(4)}`;
+    }
+
     const sentMessages = await enviarTelegram(message, sUpper);
 
     history.unshift({
@@ -403,9 +623,19 @@ async function simulateSignalEffect(symbol, type, options = {}) {
         tangente,
         sentMessages: sentMessages || [],
         observation: null,
-        id: Date.now()
+        id: Date.now(),
+        // Add Simulated Entry Info for Card/History
+        lastEntryType: tUpper.includes('LONG') ? 'LONG' : 'SHORT',
+        lastEntryPrice: formatPrice(mockEntryPrice, mockEntryPrice) // O usar precio actual si se tuviera
     });
     if (history.length > 20) history.pop();
+
+    // Actualizar estadoAlertas para que la card muestre la entrada simulada también
+    const key = `${sUpper}_2h`;
+    if (!estadoAlertas[key]) estadoAlertas[key] = {};
+    estadoAlertas[key].lastEntryType = tUpper.includes('LONG') ? 'LONG' : 'SHORT';
+    estadoAlertas[key].lastEntryPrice = mockEntryPrice;
+
     return message;
 }
 
@@ -486,16 +716,37 @@ if (bot) {
         const marketData = await fetchData(symbol, interval, 100);
 
         if (marketData) {
-            const indicadores = calcularIndicadores(marketData.closes);
+            const indicadores = calcularIndicadores(marketData.closes, marketData.highs, marketData.lows);
             if (indicadores) {
-                const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend);
+                const { tangente, curveTrend } = indicadores;
+                const estadoInfo = obtenerEstado(indicadores.tangente, indicadores.curveTrend, symbol);
 
-                const reportMsg = `✍️ REPORTE MANUAL
+                // Calcular Entry Price
+                // Necesitamos la señal (LONG/SHORT/TERRENO)
+                // Si estadoInfo.terrain es definido, usamos eso. Si no, inferimos de texto o tangente?
+                // Mejor lógica:
+                let signalForCalc = null;
+                if (estadoInfo.terrain) signalForCalc = estadoInfo.terrain;
+                else if (tangente > 0) signalForCalc = 'LONG';
+                else if (tangente < 0) signalForCalc = 'SHORT';
+
+                let entryPrice = null;
+                if (signalForCalc) {
+                    entryPrice = calculateEntryPrice(signalForCalc, marketData.highs, marketData.lows);
+                }
+
+                let reportMsg = `✍️ REPORTE MANUAL
+                
 💎 ${symbol} (${interval})
 Precio: $${indicadores.currentPrice}
 Estado: ${estadoInfo.text} ${estadoInfo.emoji}
+`;
 
-🕒 ${getPeruTime()} (PE)`;
+                if (entryPrice && (estadoInfo.terrain || signalForCalc)) {
+                    reportMsg += `\n🎯 Posible Entrada ${signalForCalc}: $${entryPrice}`;
+                }
+
+                reportMsg += `\n\n🕒 ${getPeruTime()} (PE)`;
 
                 // Responder en el MISMO hilo
                 await bot.sendMessage(chatId, reportMsg, { message_thread_id: threadId });
@@ -610,27 +861,36 @@ app.post('/admin/update-signal', async (req, res) => {
     // Recalculamos el estadoInfo original basado en tangente almacenada o texto almacenado
     // Para simplificar, usamos el texto guardado en history.
 
-    const obsEmojis = { "Señal dudosa": "🤔", "Señal FALSA": "❌", "Liquidaciones a favor": "💰", "Liquidaciones en contra": "💀" };
+    const obsEmojis = { "Señal dudosa": "🤔", "Señal FALSA": "❌", "Liquidaciones a favor": "💰", "Liquidaciones en contra": "💀", "Señal aprobada por Ditox": "✅" };
     const obsEmoji = obsEmojis[observationType] || "";
 
-    // Reconstruir el mensaje base. NOTA: Esto debe coincidir con el formato original.
-    // Como no guardamos el mensaje exacto, lo reconstruimos.
-    // Buscamos el emoji del estado original.
-    // Esto es un poco hacky si cambió la lógica, pero servirá.
+    let baseMessage = "";
 
-    // MEJORA: Guardar el mensaje base en history o reconstruirlo igual.
-    // Reconstrucción:
-    const baseMessage = `🚀 ALERTA DITOX
-
+    if (signalEntry.isConsolidated) {
+        // Formato para mensaje consolidado
+        const type = signalEntry.signal;
+        baseMessage = `🚨 ALERTA DE MERCADO DITOX - ${signalEntry.consolidatedDateStr}\n\nEn terreno de ${type},\nA TRADEAR! 🚀🔥\n\nDominantes: ${signalEntry.consolidatedDominants}\n\nObservación (by Ditox): ${observationType} ${obsEmoji}`;
+    } else {
+        // Formato para señal individual
+        baseMessage = `🚀 ALERTA DITOX
 💎 ${signalEntry.symbol}
 
 ⏱ Temporalidad: ${signalEntry.interval}
 📈 Estado: ${signalEntry.estadoText} ${signalEntry.estadoText.includes('LONG') && signalEntry.tangente > 1 ? '🚀' :
-            signalEntry.estadoText.includes('LONG') ? '🟢' :
-                signalEntry.estadoText.includes('SHORT') && signalEntry.tangente < -1 ? '🩸' :
-                    signalEntry.estadoText.includes('SHORT') ? '🔴' :
-                        signalEntry.estadoText.includes('Terreno de LONG') ? '🍏' : '🍎'}
+                signalEntry.estadoText.includes('LONG') ? '🟢' :
+                    signalEntry.estadoText.includes('SHORT') && signalEntry.tangente < -1 ? '🩸' :
+                        signalEntry.estadoText.includes('SHORT') ? '🔴' :
+                            signalEntry.estadoText.includes('Terreno de LONG') ? '🍏' : '🍎'}
  Observación (by Ditox): ${observationType} ${obsEmoji}`;
+
+        // Añadir entrada si existía en original?
+        // Problema: No guardamos el mensaje original completo, y reconstruirlo con entryPrice (si no lo guardamos bien) es difícil.
+        // Solución: Si tenemos lastEntryPrice, lo añadimos.
+        if (signalEntry.lastEntryPrice && (signalEntry.estadoText.includes('En terreno de') || signalEntry.signal.includes('LONG') || signalEntry.signal.includes('SHORT'))) {
+            const typeStr = signalEntry.signal.includes('LONG') ? 'LONG' : 'SHORT';
+            baseMessage += `\n\n🎯 Posible Entrada ${typeStr} (al tick): $${signalEntry.lastEntryPrice.toFixed(4)}`;
+        }
+    }
 
     console.log(`📝 Actualizando señal ${signalId} con observación: ${observationType}`);
 
@@ -727,8 +987,8 @@ async function procesarMercado() {
             const marketData = await fetchData(symbol, interval);
             if (!marketData) continue;
 
-            const { closes, closeTimes } = marketData;
-            const indicadores = calcularIndicadores(closes);
+            const { closes, highs, lows, closeTimes } = marketData;
+            const indicadores = calcularIndicadores(closes, highs, lows);
             if (!indicadores) continue;
 
             const lastCandleTime = closeTimes[closeTimes.length - 1];
@@ -746,10 +1006,18 @@ async function procesarMercado() {
             estadoAlertas[key].currentPrice = indicadores.currentPrice;
             estadoAlertas[key].tangente = indicadores.tangente;
 
-            const signal = evaluarAlertas(symbol, interval, indicadores, lastCandleTime);
+            const result = evaluarAlertas(symbol, interval, indicadores, lastCandleTime, highs, lows);
 
-            if (signal) {
-                const message = `🚀 ALERTA DITOX\n\n💎 ${symbol}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+            if (result && result.signal) {
+                const { signal, entryPrice } = result;
+
+                let message = `🚀 ALERTA DITOX\n\n💎 ${symbol}\n\n⏱ Temporalidad: ${interval}\n📈 Estado: ${estadoInfo.text} ${estadoInfo.emoji}`;
+
+                if (entryPrice && (estadoInfo.text.includes('En terreno de') || signal.includes('LONG') || signal.includes('SHORT'))) {
+                    const typeStr = signal.includes('LONG') ? 'LONG' : 'SHORT';
+                    message += `\n\n🎯 Posible Entrada ${typeStr} (al tick): $${entryPrice}`;
+                }
+
                 const sentMessages = await enviarTelegram(message, symbol);
 
                 history.unshift({
@@ -845,7 +1113,26 @@ async function checkConsolidatedAlerts() {
 
                 const message = `🚨 ALERTA DE MERCADO DITOX - ${dateStr}\n\nEn terreno de ${type},\nA TRADEAR! 🚀🔥\n\nDominantes: ${dominantPairs}`;
 
-                await enviarTelegram(message);
+                const sentMessages = await enviarTelegram(message);
+
+                // Guardar en historial para poder observar
+                history.unshift({
+                    time: new Date().toISOString(),
+                    symbol: 'MERCADO', // Símbolo especial para generales
+                    interval: 'Global',
+                    signal: `${type}`,
+                    estadoText: `Consolidado ${type}`,
+                    estadoEmoji: type === 'LONG' ? '🚀' : '🔻',
+                    tangente: 0,
+                    sentMessages: sentMessages || [],
+                    observation: null,
+                    id: Date.now(),
+                    isConsolidated: true, // Flag importante para reconstrur el mensaje
+                    consolidatedDateStr: dateStr,
+                    consolidatedDominants: dominantPairs
+                });
+                if (history.length > 20) history.pop();
+
                 terrainAlertsTracker.lastConsolidatedAlert[type] = now;
             }
         }
@@ -856,6 +1143,15 @@ setInterval(procesarMercado, CHECK_INTERVAL_MS);
 procesarMercado();
 
 
+// Endpoint API para actualizaciones dinámicas (AJAX)
+app.get('/api/dashboard-data', (req, res) => {
+    res.json({
+        marketSummary,
+        estadoAlertas,
+        history: history.slice(0, 20)
+    });
+});
+
 // --- 6. DASHBOARD FRONTEND ---
 app.get('/', (req, res) => {
     const generateCards = (symbols) => symbols.map(s => {
@@ -865,6 +1161,15 @@ app.get('/', (req, res) => {
         const price = estado.currentPrice ? `$${estado.currentPrice}` : 'Cargando...';
         const statusText = estado.currentStateText || 'Esperando datos...';
         const statusEmoji = estado.currentStateEmoji || '⏳';
+
+        let lastEntryInfo = '';
+        if (estado.lastEntryPrice) {
+            const type = estado.lastEntryType || (estado.currentStateText && estado.currentStateText.includes('LONG') ? 'LONG' : 'SHORT');
+            // Formatear precio
+            lastEntryInfo = `<div class="mt-2 text-xs font-mono text-purple-300 bg-purple-900/30 p-1 rounded border border-purple-500/30 text-center">
+                🎯 Última entrada ${type}: $${estado.lastEntryPrice.toFixed(4)}
+            </div>`;
+        }
 
         return `
             <div data-symbol="${s}" data-price="${price}" data-status="${statusText} ${statusEmoji}" 
@@ -881,9 +1186,10 @@ app.get('/', (req, res) => {
                 
                 <div class="relative z-10 mb-6">
                     <p class="text-sm font-medium text-gray-300">${statusText}</p>
+                    ${lastEntryInfo}
                 </div>
 
-                <button onclick="openReviewModal('${s}', '${price}', '${statusText}', '${statusEmoji}')" 
+                <button onclick="openReviewModal('${s}', '${price}', '${statusText}', '${statusEmoji}', '${estado.lastEntryType || ''}', '${estado.lastEntryPrice || ''}')" 
                     class="relative z-10 w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold py-2 px-4 rounded-xl shadow-lg hover:shadow-blue-500/30 transition-all duration-300 transform hover:-translate-y-0.5 active:translate-y-0 text-sm">
                     Revisar
                 </button>
@@ -905,6 +1211,7 @@ app.get('/', (req, res) => {
                     <option value="Señal FALSA">Señal FALSA</option>
                     <option value="Liquidaciones a favor de la señal">Liquidaciones a favor</option>
                     <option value="Liquidaciones en contra de la señal">Liquidaciones en contra</option>
+                    <option value="Señal aprobada por Ditox">Señal aprobada por Ditox</option>
                 </select>
                 <button onclick="updateSignal('${h.id}')" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-2 py-1 rounded w-full">
                     Actualizar Reporte
@@ -1015,10 +1322,10 @@ app.get('/', (req, res) => {
                 <!-- Left: Advanced Rocket Gauge -->
                 <div class="flex flex-col items-center">
                     <h3 class="text-lg font-semibold text-gray-400 mb-8">¿Hacia dónde vamos?</h3>
-                    <div class="gauge-container" style="--fire-scale: ${marketSummary.fireIntensity * 1.4}; --fire-opacity: ${marketSummary.fireIntensity};">
+                    <div id="rocket-gauge-container" class="gauge-container" style="--fire-scale: ${marketSummary.fireIntensity * 1.4}; --fire-opacity: ${marketSummary.fireIntensity};">
                         <div class="gauge-arc"></div>
-                        <div class="rocket-pivot" style="--rot-base: ${marketSummary.rocketAngle}deg; transform: translateY(-50%) rotate(${marketSummary.rocketAngle}deg);">
-                            <div class="rocket-wrapper" style="filter: grayscale(${1 - marketSummary.saturation}) opacity(${marketSummary.opacity});">
+                        <div id="rocket-pivot" class="rocket-pivot" style="--rot-base: ${marketSummary.rocketAngle}deg; transform: translateY(-50%) rotate(${marketSummary.rocketAngle}deg);">
+                            <div id="rocket-wrapper" class="rocket-wrapper" style="filter: grayscale(${1 - marketSummary.saturation}) opacity(${marketSummary.opacity});">
                                 <div class="rocket">🚀</div>
                             </div>
                         </div>
@@ -1028,7 +1335,7 @@ app.get('/', (req, res) => {
                 <!-- Right: Mega State -->
                 <div class="text-center md:text-left">
                     <p class="text-gray-400 text-sm uppercase tracking-widest mb-2 font-semibold">Estado Dominante</p>
-                    <h2 class="text-5xl md:text-6xl font-black tracking-tighter leading-none transition-all duration-100 animate-breathing" 
+                    <h2 id="dominant-state" class="text-5xl md:text-6xl font-black tracking-tighter leading-none transition-all duration-100 animate-breathing" 
                         style="color: ${marketSummary.rocketColor}">
                         ${marketSummary.dominantState.toUpperCase()}
                     </h2>
@@ -1091,7 +1398,7 @@ app.get('/', (req, res) => {
                             <th class="py-4 px-6 font-semibold ditox-column hidden">Observación (by Ditox)</th>
                         </tr>
                     </thead>
-                    <tbody class="text-sm divide-y divide-gray-700/50">
+                    <tbody id="history-table-body" class="text-sm divide-y divide-gray-700/50">
                         ${historyRows.length ? historyRows : '<tr><td colspan="6" class="py-8 text-center text-gray-500 italic">Esperando primeras señales del mercado...</td></tr>'}
                     </tbody>
                 </table>
@@ -1124,6 +1431,10 @@ app.get('/', (req, res) => {
         </div>
     </div>
 
+
+
+    </div>
+
     <!-- Modals -->
     <dialog id="modal-info" class="bg-gray-900 text-white rounded-2xl p-0 w-full max-w-2xl shadow-2xl backdrop:bg-black/80 border border-gray-700">
         <div class="p-8">
@@ -1144,37 +1455,17 @@ app.get('/', (req, res) => {
                         </li>
                         <li class="bg-blue-900/20 p-3 rounded-lg border border-blue-500/30">
                             <strong class="text-blue-400 block mb-1">⚡ En curso...:</strong> 
-                            Ya se está dando el movimiento. Si no entraste, espera a que se calme el mercado. Si estás dentro, ten la confianza en que si se mantiene este estado, puedes estar tranquilo esperando más ganancias.
+                            El movimiento ya se está dando.
                         </li>
                         <li class="bg-green-900/20 p-3 rounded-lg border border-green-500/30">
                             <strong class="text-green-400 block mb-1">🍏 En terreno de...:</strong> 
-                            El mercado se calmó y probablemente esté a puertas de dar otro movimiento; el movimiento anterior se desaceleró y puede cambiar de dirección.
+                            El mercado se calmó y probablemente esté a puertas de dar otro movimiento.
                         </li>
                         <li class="bg-gray-800/50 p-3 rounded-lg border border-gray-600/30">
                             <strong class="text-gray-400 block mb-1">🦀 Indecisión:</strong>
-                            El mercado no habla claro, lo mejor es abstenerse.
+                            El mercado no habla claro.
                         </li>
                     </ul>
-                </div>
-
-                <div>
-                    <h4 class="font-bold text-white mb-2 text-lg">Resumen del Mercado y Cohete:</h4>
-                    <p class="text-sm mb-3">El cohete central es un indicador dinámico del sentimiento global:</p>
-                    <ul class="space-y-2 text-sm text-gray-400">
-                        <li class="flex items-start gap-2">
-                            <span class="text-white">•</span>
-                            <span><strong>Inclinación:</strong> El rango es de 90° (Bajista Extremo) a -90° (Alcista Extremo). Se entra en <strong>Euforia</strong> al superar los 45° en cualquier dirección.</span>
-                        </li>
-                        <li class="flex items-start gap-2">
-                            <span class="text-white">•</span>
-                            <span><strong>Color:</strong> Se vuelve más verde mientras más activos estén en "Terreno de LONG" y más rojo en "Terreno de SHORT".</span>
-                        </li>
-                    </ul>
-                </div>
-
-                <div>
-                    <h4 class="font-bold text-white mb-1">Alertas Inteligentes:</h4>
-                    <p class="text-sm">Para reducir ruido, las alertas de "Terreno de..." ahora se consolidan. Solo recibirás una notificación general cuando al menos <strong class="text-white">3 activos diferentes</strong> entren en dicho terreno en un lapso de 1 hora.</p>
                 </div>
             </div>
             <div class="mt-8 text-right">
@@ -1187,8 +1478,7 @@ app.get('/', (req, res) => {
         <div class="p-8 border-l-4 border-red-500">
             <h3 class="text-2xl font-bold mb-4 text-red-500">⚠️ Advertencia de Riesgo</h3>
             <p class="text-gray-300 mb-6 leading-relaxed">
-                IndicAlert <strong class="text-white">NO es una herramienta de asesoría financiera</strong> y sus señales no deben tomarse como consejos de inversión segura.
-                El mercado de criptomonedas es altamente volátil. Opera bajo tu propio riesgo y realiza siempre tu propio análisis (DYOR).
+                IndicAlert <strong class="text-white">NO es una herramienta de asesoría financiera</strong>. DYOR.
             </p>
             <div class="text-right">
                 <button onclick="this.closest('dialog').close()" class="text-gray-400 hover:text-white text-sm underline">Cerrar</button>
@@ -1219,6 +1509,12 @@ app.get('/', (req, res) => {
                 </div>
             </div>
 
+            <div id="review-entry-container" class="mt-4 p-4 rounded-2xl bg-purple-900/20 border border-purple-500/30 hidden">
+                <p class="text-xs text-purple-400 uppercase font-bold mb-1">🎯 Última Entrada</p>
+                <p id="review-entry" class="text-lg font-mono text-white font-bold"></p>
+            </div>
+            <br>
+
             <button onclick="this.closest('dialog').close()" class="w-full py-3 rounded-xl bg-white text-slate-900 font-bold hover:bg-gray-200 transition-colors">
                 Cerrar Vista
             </button>
@@ -1240,16 +1536,55 @@ app.get('/', (req, res) => {
     </dialog>
 
     <script>
-        // Auto-refresh suave
-        setTimeout(() => window.location.reload(), 30000); // 30s para no ser molesto
+        // --- SOUND EFFECTS (POP ONLY) ---
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        function playPopSound() {
+            if(audioContext.state === 'suspended') audioContext.resume();
+            const osc = audioContext.createOscillator();
+            const gain = audioContext.createGain();
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(200, audioContext.currentTime);
+            osc.frequency.linearRampToValueAtTime(50, audioContext.currentTime + 0.08);
+            gain.gain.setValueAtTime(0.7, audioContext.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.08);
+            osc.connect(gain);
+            gain.connect(audioContext.destination);
+            osc.start();
+            osc.stop(audioContext.currentTime + 0.08);
+        }
 
-        function openReviewModal(symbol, price, status, emoji) {
+        // Attach to all buttons globally
+        document.addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON' || e.target.closest('button')) {
+                playPopSound();
+            }
+        });
+
+        function openReviewModal(symbol, price, status, emoji, entryType, entryPrice) {
             document.getElementById('review-symbol').textContent = symbol;
             document.getElementById('review-price').textContent = price;
             document.getElementById('review-status').textContent = status;
             document.getElementById('review-emoji').textContent = emoji;
+
+            const entryContainer = document.getElementById('review-entry-container');
+            const entryText = document.getElementById('review-entry');
+
+            if (entryPrice && entryPrice !== 'undefined' && entryPrice !== '') {
+                entryContainer.classList.remove('hidden');
+                // Ya viene formateado del servidor
+                entryText.textContent = entryType + ': $' + entryPrice;
+            } else {
+                entryContainer.classList.add('hidden');
+            }
+
             document.getElementById('modal-review').showModal();
         }
+
+        // Auto-refresh suave
+        setTimeout(() => window.location.reload(), 30000); // 30s
+
+
 
         // --- CUSTOM PROMPT LOGIC ---
         let currentPromptResolver = null;
